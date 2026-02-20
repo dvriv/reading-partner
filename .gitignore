@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+dist/
+coverage/
+client/node_modules/
+client/dist/
+server/node_modules/
+server/dist/
+server/.env
+client/.env
+example*.html
+example*.png

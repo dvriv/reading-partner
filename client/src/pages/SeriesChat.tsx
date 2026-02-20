@@ -437,7 +437,7 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
               <div className="p-4">
                 <SeriesBookList
                   books={books}
-                  onSetStatus={(book, status) => void handleSetBookStatus(book, status)}
+                  onSetStatus={(book, status) => handleSetBookStatus(book, status)}
                 />
                 <button
                   className="rp-btn rp-btn-secondary mt-3 w-full"

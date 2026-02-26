@@ -141,7 +141,6 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
         onClose={() => setOpenUploadModal(false)}
         onComplete={async () => {
           setUploadTargetSeriesId(null);
-          setOpenUploadModal(false);
           await loadAll();
         }}
       />

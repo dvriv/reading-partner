@@ -9,6 +9,8 @@ function getMessage(res: Response): string {
 interface RetryOptions {
   maxAttempts: number;
   baseDelayMs: number;
+  signal?: AbortSignal;
+  shouldCancel?: () => boolean;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -29,10 +31,15 @@ export async function embedChunksWithRetry(
     let lastError: Error | null = null;
 
     while (attempt < options.maxAttempts) {
+      if (options.signal?.aborted || options.shouldCancel?.()) {
+        throw new ProviderRequestError('Upload cancelled.', 'embed_cancelled');
+      }
+
       attempt += 1;
       try {
         const res = await fetch(`${API_BASE}/embed`, {
           method: 'POST',
+          signal: options.signal,
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${authToken}`
@@ -53,6 +60,9 @@ export async function embedChunksWithRetry(
         lastError = null;
         break;
       } catch (error) {
+        if (options.signal?.aborted || options.shouldCancel?.()) {
+          throw new ProviderRequestError('Upload cancelled.', 'embed_cancelled');
+        }
         lastError =
           error instanceof ProviderRequestError
             ? error

@@ -21,7 +21,7 @@ export default function ChatMessage({
   const [showCitations, setShowCitations] = useState(false);
   const [showTrace, setShowTrace] = useState(false);
   const [expandedCitationKeys, setExpandedCitationKeys] = useState<Set<string>>(new Set());
-  const [fullChunk, setFullChunk] = useState<{ title: string; chapterNumber: number; content: string } | null>(null);
+  const [fullChunk, setFullChunk] = useState<{ title: string; chapterNumber: number; chapterLabel: string; content: string } | null>(null);
   const [openingChunk, setOpeningChunk] = useState(false);
   const isUser = message.role === 'user';
   const citationCount = message.citations?.length ?? 0;
@@ -31,7 +31,7 @@ export default function ChatMessage({
       if (a.bookTitle !== b.bookTitle) {
         return a.bookTitle.localeCompare(b.bookTitle);
       }
-      return a.chapterNumber - b.chapterNumber;
+      return a.chapterLabel.localeCompare(b.chapterLabel, undefined, { numeric: true, sensitivity: 'base' });
     });
   }, [message.citations]);
   const stateClass =
@@ -59,6 +59,7 @@ export default function ChatMessage({
         setFullChunk({
           title: item.bookTitle,
           chapterNumber: item.chapterNumber,
+          chapterLabel: item.chapterLabel,
           content: item.fullChunk
         });
         return;
@@ -71,6 +72,7 @@ export default function ChatMessage({
           setFullChunk({
             title: item.bookTitle,
             chapterNumber: item.chapterNumber,
+            chapterLabel: item.chapterLabel,
             content: chunk.content
           });
           return;
@@ -80,6 +82,7 @@ export default function ChatMessage({
       setFullChunk({
         title: item.bookTitle,
         chapterNumber: item.chapterNumber,
+        chapterLabel: item.chapterLabel,
         content: item.snippet
       });
     } finally {
@@ -135,7 +138,7 @@ export default function ChatMessage({
             {showCitations ? (
                <ul className="mt-2 space-y-2 text-xs text-[var(--ink-secondary)]" aria-label="Citations">
                 {citations.map((citation, index) => {
-                  const citationKey = `${citation.bookTitle}-${citation.chapterNumber}-${index}`;
+                  const citationKey = `${citation.bookTitle}-${citation.chapterLabel}-${index}`;
                   const excerpt = citation.excerpt.trim();
                   const expanded = expandedCitationKeys.has(citationKey);
                   const preview = excerpt.length > 180 ? `${excerpt.slice(0, 180)}...` : excerpt;
@@ -143,7 +146,7 @@ export default function ChatMessage({
                   return (
                      <li key={citationKey} className="rounded-lg border border-[var(--line-subtle)] bg-[var(--paper-elevated)] p-3">
                     <span className="rounded bg-[rgba(15,118,110,0.12)] px-1 py-0.5 font-semibold text-[var(--accent-binding)]">
-                      {standalone ? `[Chapter ${citation.chapterNumber}]` : `[${citation.bookTitle}, Chapter ${citation.chapterNumber}]`}
+                      {standalone ? `[${citation.chapterLabel}]` : `[${citation.bookTitle}, ${citation.chapterLabel}]`}
                     </span>{' '}
                     <span className="italic">"{expanded ? excerpt : preview}"</span>
                     {excerpt.length > 180 ? (
@@ -189,10 +192,10 @@ export default function ChatMessage({
                         type="button"
                         className="w-full rounded-lg border border-[var(--line-subtle)] p-3 text-left transition hover:bg-[var(--paper-surface)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--line-focus)]"
                         onClick={() => void openTraceItemChunk(item)}
-                        aria-label={`Open full chunk for ${item.bookTitle} chapter ${item.chapterNumber}`}
+                        aria-label={`Open full chunk for ${item.bookTitle} ${item.chapterLabel}`}
                       >
                         <p className="font-medium text-[var(--ink-primary)]">
-                          #{item.rank} {item.bookTitle} Ch.{item.chapterNumber}
+                          #{item.rank} {item.bookTitle} {item.chapterLabel}
                         </p>
                         <p className="text-[var(--ink-secondary)]">{item.snippet}</p>
                         <p className="mt-1 text-[11px] uppercase tracking-wide text-[var(--ink-muted)]">
@@ -242,7 +245,7 @@ export default function ChatMessage({
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--ink-muted)]">Retrieved Passage</p>
                   <h3 className="mt-1 text-base font-semibold text-[var(--ink-primary)]">
-                    {fullChunk.title} - Chapter {fullChunk.chapterNumber}
+                    {fullChunk.title} - {fullChunk.chapterLabel}
                   </h3>
                 </div>
                 <button className="rp-btn rp-btn-secondary min-h-9 px-3 text-sm" onClick={() => setFullChunk(null)}>

@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowLeft, BookOpen, Info, Lock, MoreVertical } from 'lucide-react';
-import { getContextMessages, getDb } from '../lib/db';
+import { getBookChapters, getContextMessages, getDb } from '../lib/db';
 import { normalizeBookRecord } from '../lib/ingestion-state';
 import { askBookQuestion } from '../lib/llm';
 import { isProviderRequestError } from '../lib/provider-error';
 import { searchBook } from '../lib/search';
-import type { Book, ChatMessage as ChatMessageType } from '../types';
+import type { Book, Chapter, ChatMessage as ChatMessageType } from '../types';
 import ChatMessage from '../components/ChatMessage';
 import ChatInput from '../components/ChatInput';
 
@@ -18,6 +18,7 @@ interface BookChatProps {
 export default function BookChat({ bookId, authToken, onBack }: BookChatProps) {
   const [book, setBook] = useState<Book | null>(null);
   const [messages, setMessages] = useState<ChatMessageType[]>([]);
+  const [chapters, setChapters] = useState<Chapter[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [retryCountdown, setRetryCountdown] = useState(0);
@@ -32,9 +33,15 @@ export default function BookChat({ bookId, authToken, onBack }: BookChatProps) {
     const bookRecord = await db.get('books', bookId);
     if (!bookRecord) return;
     const chat = (await getContextMessages(bookId)).filter((message) => message.contextType === 'book');
+    const chapterRecords = await getBookChapters(bookId);
     setBook(normalizeBookRecord(bookRecord));
     setMessages(chat);
+    setChapters(chapterRecords);
   }
+
+  const currentChapterLabel = book && book.currentChapter > 0
+    ? chapters.find((chapter) => chapter.chapterNumber === book.currentChapter)?.title || `Chapter ${book.currentChapter}`
+    : 'Unread';
 
   useEffect(() => {
     void reload();
@@ -79,7 +86,7 @@ export default function BookChat({ bookId, authToken, onBack }: BookChatProps) {
         contextType: 'book',
         role: 'assistant',
         content:
-          "You haven't started reading yet. Set your progress to at least Chapter 1 to begin asking questions.",
+          "You haven't started reading yet. Set your progress to at least the first chapter to begin asking questions.",
         createdAt: new Date().toISOString(),
         confidence: 'low',
         assistantState: 'no-context'
@@ -120,6 +127,7 @@ export default function BookChat({ bookId, authToken, onBack }: BookChatProps) {
           chunkId: result.id,
           bookTitle: book.title,
           chapterNumber: result.chapterNumber,
+          chapterLabel: result.chapterLabel,
           snippet: result.content.slice(0, 180),
           fullChunk: result.content,
           combinedScore: result.score,
@@ -147,9 +155,10 @@ export default function BookChat({ bookId, authToken, onBack }: BookChatProps) {
       const chunks = results.map((result) => ({
         content: result.content,
         bookTitle: book.title,
-        chapterNumber: result.chapterNumber
+        chapterNumber: result.chapterNumber,
+        chapterLabel: result.chapterLabel
       }));
-      const response = await askBookQuestion(book.title, book.currentChapter, question, chunks, authToken);
+      const response = await askBookQuestion(book.title, book.currentChapter, currentChapterLabel, question, chunks, authToken);
 
       const assistantMessage: ChatMessageType = {
         contextId: bookId,
@@ -213,7 +222,7 @@ export default function BookChat({ bookId, authToken, onBack }: BookChatProps) {
             </span>
             <div>
               <h2 className="text-lg font-semibold text-[var(--ink-primary)]">Discussion: {book.title}</h2>
-              <p className="text-sm text-[var(--ink-secondary)]">Current Chapter: {book.currentChapter}</p>
+              <p className="text-sm text-[var(--ink-secondary)]">Current Chapter: {currentChapterLabel}</p>
             </div>
           </div>
           <div className="flex items-center gap-1 text-[var(--ink-muted)]">
@@ -226,7 +235,7 @@ export default function BookChat({ bookId, authToken, onBack }: BookChatProps) {
       <div className="border-b border-[rgba(217,119,6,0.18)] bg-[rgba(254,243,199,0.35)] px-3 py-2 text-center text-sm font-medium text-[rgba(146,64,14,0.85)] md:px-6">
         <p className="mx-auto flex max-w-5xl items-center justify-center gap-2">
           <Lock size={14} />
-          Spoiler Safe Zone: Up to {book.title}, Ch. {book.currentChapter}
+            Spoiler Safe Zone: Up to {book.title}, {currentChapterLabel}
         </p>
       </div>
 

@@ -36,18 +36,20 @@ export default function ProgressSlider({
   return (
     <div className="rp-surface-elevated rounded-xl p-4">
       <p className="text-sm font-semibold text-[var(--ink-secondary)]">Reading Progress</p>
-      <input
-        type="range"
-        min={0}
-        max={totalChapters}
-        value={value}
-        onChange={(event) => setValue(Number(event.target.value))}
-        className="mt-2 w-full accent-[var(--accent-binding)]"
-      />
-      <p className="text-sm font-medium text-[var(--ink-primary)]">
-        Chapter {value}/{totalChapters}
-      </p>
-      <p className="text-xs text-[var(--ink-tertiary)]">{chapterTitle}</p>
+      <div className="mt-2 flex items-center gap-3">
+        <input
+          type="range"
+          min={0}
+          max={totalChapters}
+          value={value}
+          onChange={(event) => setValue(Number(event.target.value))}
+          className="min-w-0 flex-1 accent-[var(--accent-binding)]"
+        />
+        <span className="w-20 shrink-0 text-right text-xs font-medium tabular-nums text-[var(--ink-tertiary)]">
+          {value}/{totalChapters}
+        </span>
+      </div>
+      <p className="mt-1 w-full truncate text-sm font-medium text-[var(--ink-primary)]" title={chapterTitle}>{chapterTitle}</p>
     </div>
   );
 }

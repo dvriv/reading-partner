@@ -58,10 +58,16 @@ export interface ResumeResult {
   indexed: boolean;
 }
 
+interface ResumeControls {
+  signal?: AbortSignal;
+  shouldCancel?: () => boolean;
+}
+
 export async function resumeBookIngestion(
   bookId: string,
   authToken: string,
-  onProgress?: (meta: IngestionMetadata) => void
+  onProgress?: (meta: IngestionMetadata) => void,
+  controls?: ResumeControls
 ): Promise<ResumeResult> {
   const db = await getDb();
   const bookRecord = await db.get('books', bookId);
@@ -83,7 +89,15 @@ export async function resumeBookIngestion(
 
   const missing = chunksWithIds.filter((chunk) => !chunk.embedding);
 
+  const throwIfCancelled = () => {
+    if (controls?.signal?.aborted || controls?.shouldCancel?.()) {
+      throw new Error('UPLOAD_CANCELLED');
+    }
+  };
+
   try {
+    throwIfCancelled();
+
     const started = await db.get('books', bookId);
     if (started) {
       const next = normalizeBookRecord(started);
@@ -107,11 +121,18 @@ export async function resumeBookIngestion(
     if (missing.length > 0) {
       let embeddedCount = chunksWithIds.length - missing.length;
       for (let i = 0; i < missing.length; i += EMBED_BATCH_SIZE) {
+        throwIfCancelled();
+
         const batch = missing.slice(i, i + EMBED_BATCH_SIZE);
         const vectors = await embedChunks(
           batch.map((chunk) => chunk.content),
           authToken,
-          { maxAttempts: 4, baseDelayMs: 600 }
+          {
+            maxAttempts: 4,
+            baseDelayMs: 600,
+            signal: controls?.signal,
+            shouldCancel: controls?.shouldCancel,
+          }
         );
 
         for (let index = 0; index < batch.length; index += 1) {
@@ -142,6 +163,8 @@ export async function resumeBookIngestion(
       { stage: 'index', completed: 0, total: 1, percentage: 0, error: null },
       onProgress
     );
+
+    throwIfCancelled();
 
     await rebuildIndexForBook(bookId);
     if (book.seriesId) {

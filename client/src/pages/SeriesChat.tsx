@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, BookOpen, Lock, PanelLeft, X } from 'lucide-react';
-import { getContextMessages, getDb, updateBookStatus } from '../lib/db';
+import { getBookChapters, getContextMessages, getDb, updateBookStatus } from '../lib/db';
 import { normalizeBookRecord } from '../lib/ingestion-state';
 import { askSeriesQuestion } from '../lib/llm';
 import { isProviderRequestError } from '../lib/provider-error';
 import { searchSeries } from '../lib/search';
-import type { Book, ChatMessage as ChatMessageType, Series } from '../types';
+import type { Book, Chapter, ChatMessage as ChatMessageType, Series } from '../types';
 import SeriesBookList from '../components/SeriesBookList';
 import ChatMessage from '../components/ChatMessage';
 import ChatInput from '../components/ChatInput';
@@ -27,6 +27,7 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
   const [openUploadModal, setOpenUploadModal] = useState(false);
   const [mobileBooksOpen, setMobileBooksOpen] = useState(false);
   const [chapterValue, setChapterValue] = useState(0);
+  const [readingBookChapters, setReadingBookChapters] = useState<Chapter[]>([]);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   function scrollToBottom() {
@@ -66,6 +67,26 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
     }
     setChapterValue(readingBook.currentChapter);
   }, [readingBook?.id, readingBook?.currentChapter]);
+
+  useEffect(() => {
+    if (!readingBook) {
+      setReadingBookChapters([]);
+      return;
+    }
+
+    void (async () => {
+      const chapterRecords = await getBookChapters(readingBook.id);
+      setReadingBookChapters(chapterRecords);
+    })();
+  }, [readingBook?.id]);
+
+  const chapterLabelForValue = (value: number): string => {
+    if (!readingBook || value < 1) return 'Unread';
+    return readingBookChapters.find((chapter) => chapter.chapterNumber === value)?.title || `Chapter ${value}`;
+  };
+
+  const currentChapterLabel = chapterLabelForValue(readingBook?.currentChapter ?? 0);
+  const selectedChapterLabel = chapterLabelForValue(chapterValue);
 
   useEffect(() => {
     if (!readingBook) return;
@@ -152,7 +173,7 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
         contextType: 'series',
         role: 'assistant',
         content:
-          "You haven't started reading yet. Set your progress to at least Chapter 1 to begin asking questions.",
+          "You haven't started reading yet. Set your progress to at least the first chapter to begin asking questions.",
         createdAt: new Date().toISOString(),
         confidence: 'low',
         assistantState: 'no-context'
@@ -200,6 +221,7 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
           chunkId: result.id,
           bookTitle: bookMap.get(result.bookId) ?? 'Unknown Book',
           chapterNumber: result.chapterNumber,
+          chapterLabel: result.chapterLabel,
           snippet: result.content.slice(0, 180),
           fullChunk: result.content,
           combinedScore: result.score,
@@ -227,7 +249,8 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
       const payloadChunks = results.map((result) => ({
         content: result.content,
         bookTitle: bookMap.get(result.bookId) || 'Unknown Book',
-        chapterNumber: result.chapterNumber
+        chapterNumber: result.chapterNumber,
+        chapterLabel: result.chapterLabel,
       }));
 
       const completed = books.filter((book) => book.status === 'done').map((book) => book.title);
@@ -235,6 +258,7 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
         series.name,
         readingBook.title,
         readingBook.currentChapter,
+        currentChapterLabel,
         completed,
         question,
         payloadChunks,
@@ -324,8 +348,9 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
 
         <section className="relative flex min-w-0 flex-1 flex-col">
           <header className="sticky top-0 z-10 border-b border-[var(--line-subtle)] bg-[rgba(255,255,255,0.85)] px-3 py-4 backdrop-blur md:px-6">
-            <div className="mx-auto flex w-full max-w-5xl items-center justify-between">
-              <div className="flex items-center gap-3">
+            <div className="mx-auto w-full max-w-5xl">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
                 <button
                   type="button"
                   className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-[var(--line-subtle)] bg-[var(--paper-elevated)] text-[var(--ink-secondary)] md:hidden"
@@ -339,41 +364,46 @@ export default function SeriesChat({ seriesId, authToken, onBack }: SeriesChatPr
                 </span>
                 <div>
                   <h2 className="text-lg font-semibold text-[var(--ink-primary)]">Reading: {readingBook?.title ?? series.name}</h2>
-                  <p className="text-sm text-[var(--ink-secondary)]">Current Chapter: {readingBook?.currentChapter ?? 0}</p>
+                  <p className="text-sm text-[var(--ink-secondary)]">Current Chapter: {currentChapterLabel}</p>
                 </div>
-                {readingBook ? (
-                  <div className="ml-2 hidden min-w-[220px] items-center gap-2 md:flex">
-                    <input
-                      type="range"
-                      min={0}
-                      max={readingBook.totalChapters}
-                      value={chapterValue}
-                      onChange={(event) => setChapterValue(Number(event.target.value))}
-                      className="w-full accent-[var(--accent-binding)]"
-                      aria-label="Reading chapter progress"
-                    />
-                    <span className="whitespace-nowrap text-xs font-medium text-[var(--ink-secondary)]">
-                      {chapterValue}/{readingBook.totalChapters}
-                    </span>
-                  </div>
-                ) : null}
+                </div>
+                <div className="flex items-center gap-1 text-[var(--ink-muted)]">
+                  <button
+                    className="rp-btn rp-btn-secondary min-h-9 px-3 text-xs"
+                    aria-label="Clear series chat"
+                    onClick={() => void clearSeriesChat()}
+                  >
+                    Clear Chat
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center gap-1 text-[var(--ink-muted)]">
-                <button
-                  className="rp-btn rp-btn-secondary min-h-9 px-3 text-xs"
-                  aria-label="Clear series chat"
-                  onClick={() => void clearSeriesChat()}
-                >
-                  Clear Chat
-                </button>
-              </div>
+
+              {readingBook ? (
+                <div className="mt-3 flex items-center gap-2">
+                  <input
+                    type="range"
+                    min={0}
+                    max={readingBook.totalChapters}
+                    value={chapterValue}
+                    onChange={(event) => setChapterValue(Number(event.target.value))}
+                    className="min-w-0 flex-1 accent-[var(--accent-binding)]"
+                    aria-label="Reading chapter progress"
+                  />
+                  <span
+                    className="w-32 shrink-0 truncate text-right text-xs font-medium tabular-nums text-[var(--ink-secondary)] sm:w-56"
+                    title={selectedChapterLabel}
+                  >
+                    {selectedChapterLabel}
+                  </span>
+                </div>
+              ) : null}
             </div>
           </header>
 
           <div className="border-b border-[rgba(217,119,6,0.18)] bg-[rgba(254,243,199,0.35)] px-3 py-2 text-center text-sm font-medium text-[rgba(146,64,14,0.85)] md:px-6">
             <p className="mx-auto flex max-w-5xl items-center justify-center gap-2">
               <Lock size={14} />
-              Spoiler Safe Zone: Up to {readingBook?.title ?? series.name}, Ch. {readingBook?.currentChapter ?? 0}
+              Spoiler Safe Zone: Up to {readingBook?.title ?? series.name}, {currentChapterLabel}
             </p>
           </div>
 

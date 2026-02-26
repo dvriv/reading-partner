@@ -9,12 +9,13 @@ export interface SearchResult {
   content: string;
   bookId: string;
   chapterNumber: number;
+  chapterLabel: string;
   score: number;
   bm25Score?: number;
   vectorScore?: number;
 }
 
-type IndexedChunk = Pick<Chunk, 'id' | 'content' | 'bookId' | 'chapterNumber' | 'embedding'>;
+type IndexedChunk = Pick<Chunk, 'id' | 'content' | 'bookId' | 'chapterNumber' | 'chapterLabel' | 'embedding'>;
 
 const ALPHA = 0.5;
 const SEARCH_TOP_K = 8;
@@ -24,10 +25,10 @@ const MIN_DONE_BOOK_RESULTS = 2;
 const SEARCH_DEBUG = import.meta.env.VITE_SEARCH_DEBUG === 'true';
 const MINI_SEARCH_OPTIONS = {
   fields: ['content'],
-  storeFields: ['content', 'chapterNumber', 'bookId']
+  storeFields: ['content', 'chapterNumber', 'chapterLabel', 'bookId']
 };
 
-export function buildSearchIndex(chunks: Array<{ id: number; content: string; bookId: string; chapterNumber: number }>) {
+export function buildSearchIndex(chunks: Array<{ id: number; content: string; bookId: string; chapterNumber: number; chapterLabel: string }>) {
   const miniSearch = new MiniSearch({
     ...MINI_SEARCH_OPTIONS,
     searchOptions: {
@@ -57,6 +58,7 @@ export function searchBM25(
     id: Number(r.id),
     content: String(r.content),
     chapterNumber: Number(r.chapterNumber),
+    chapterLabel: String(r.chapterLabel || `Chapter ${Number(r.chapterNumber)}`),
     bookId: String(r.bookId),
     score: r.score,
     bm25Score: r.score,
@@ -99,6 +101,7 @@ export function vectorSearch(
         content: chunk.content,
         bookId: chunk.bookId,
         chapterNumber: chunk.chapterNumber,
+        chapterLabel: chunk.chapterLabel,
         score: similarity,
         bm25Score: 0,
         vectorScore: similarity
@@ -112,7 +115,7 @@ export function vectorSearch(
 export function hybridMerge(bm25Results: SearchResult[], vectorResults: SearchResult[], topK = 8): SearchResult[] {
   const normBM25 = normalize(bm25Results);
   const normVector = normalize(vectorResults);
-  const scoreMap = new Map<number, { bm25: number; vector: number; content: string; bookId: string; chapterNumber: number }>();
+  const scoreMap = new Map<number, { bm25: number; vector: number; content: string; bookId: string; chapterNumber: number; chapterLabel: string }>();
 
   for (const result of normBM25) {
     scoreMap.set(result.id, {
@@ -120,7 +123,8 @@ export function hybridMerge(bm25Results: SearchResult[], vectorResults: SearchRe
       vector: 0,
       content: result.content,
       bookId: result.bookId,
-      chapterNumber: result.chapterNumber
+      chapterNumber: result.chapterNumber,
+      chapterLabel: result.chapterLabel,
     });
   }
 
@@ -135,7 +139,8 @@ export function hybridMerge(bm25Results: SearchResult[], vectorResults: SearchRe
       vector: result.score,
       content: result.content,
       bookId: result.bookId,
-      chapterNumber: result.chapterNumber
+      chapterNumber: result.chapterNumber,
+      chapterLabel: result.chapterLabel,
     });
   }
 
@@ -144,6 +149,7 @@ export function hybridMerge(bm25Results: SearchResult[], vectorResults: SearchRe
     content: values.content,
     bookId: values.bookId,
     chapterNumber: values.chapterNumber,
+    chapterLabel: values.chapterLabel,
     score: ALPHA * values.bm25 + (1 - ALPHA) * values.vector,
     bm25Score: values.bm25,
     vectorScore: values.vector
@@ -227,7 +233,8 @@ export async function rebuildIndexForBook(bookId: string): Promise<void> {
     id: chunk.id,
     content: chunk.content,
     bookId: chunk.bookId,
-    chapterNumber: chunk.chapterNumber
+    chapterNumber: chunk.chapterNumber,
+    chapterLabel: chunk.chapterLabel,
   })));
   await saveSearchIndex(bookId, index);
 }
@@ -247,7 +254,8 @@ export async function rebuildIndexForSeries(seriesId: string): Promise<void> {
     id: chunk.id,
     content: chunk.content,
     bookId: chunk.bookId,
-    chapterNumber: chunk.chapterNumber
+    chapterNumber: chunk.chapterNumber,
+    chapterLabel: chunk.chapterLabel,
   })));
 
   await saveSearchIndex(seriesId, index);
@@ -277,7 +285,8 @@ export async function searchSeries(seriesId: string, query: string, authToken: s
     id: chunk.id,
     content: chunk.content,
     bookId: chunk.bookId,
-    chapterNumber: chunk.chapterNumber
+    chapterNumber: chunk.chapterNumber,
+    chapterLabel: chunk.chapterLabel,
   })));
 
   const bm25 = searchBM25(index, query, allowedBooks, SEARCH_RETRIEVAL_LIMIT);
@@ -296,6 +305,7 @@ export async function searchSeries(seriesId: string, query: string, authToken: s
         bookId: result.bookId,
         bookTitle: titles.get(result.bookId) ?? 'Unknown Book',
         chapterNumber: result.chapterNumber,
+        chapterLabel: result.chapterLabel,
         score: Number(result.score.toFixed(4)),
         chunk: result.content,
       })),
@@ -314,7 +324,8 @@ export async function searchBook(bookId: string, query: string, maxChapter: numb
     id: chunk.id,
     content: chunk.content,
     bookId: chunk.bookId,
-    chapterNumber: chunk.chapterNumber
+    chapterNumber: chunk.chapterNumber,
+    chapterLabel: chunk.chapterLabel,
   })));
 
   const bm25 = searchBM25(index, query, allowedBooks, 20);

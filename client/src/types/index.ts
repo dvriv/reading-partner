@@ -43,6 +43,7 @@ export interface Chunk {
   id?: number;
   bookId: string;
   chapterNumber: number;
+  chapterLabel: string;
   chunkIndex: number;
   content: string;
   tokenCount: number;
@@ -51,7 +52,7 @@ export interface Chunk {
 
 export interface Citation {
   bookTitle: string;
-  chapterNumber: number;
+  chapterLabel: string;
   excerpt: string;
 }
 
@@ -60,6 +61,7 @@ export interface RetrievalTraceItem {
   chunkId?: number;
   bookTitle: string;
   chapterNumber: number;
+  chapterLabel: string;
   snippet: string;
   fullChunk?: string;
   combinedScore: number;

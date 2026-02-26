@@ -5,12 +5,14 @@ type AskChunk = {
   content: string;
   bookTitle: string;
   chapterNumber: number;
+  chapterLabel: string;
 };
 
 type AskRequest = {
   seriesName?: string;
   bookTitle: string;
   currentChapter: number;
+  currentChapterLabel: string;
   completedBooks?: string[];
   question: string;
   chunks: AskChunk[];
@@ -18,7 +20,7 @@ type AskRequest = {
 
 type AskResponse = {
   answer: string;
-  citations: { bookTitle: string; chapterNumber: number; excerpt: string }[];
+  citations: { bookTitle: string; chapterLabel: string; excerpt: string }[];
   confidence: 'high' | 'medium' | 'low';
 };
 
@@ -101,20 +103,34 @@ function normalizeAskResponse(raw: string): AskResponse {
 
     const citations = Array.isArray(parsed.citations)
       ? parsed.citations
-          .filter((citation): citation is { bookTitle: string; chapterNumber: number; excerpt: string } => {
-            return (
-              !!citation &&
-              typeof citation === 'object' &&
-              typeof (citation as { bookTitle?: unknown }).bookTitle === 'string' &&
-              Number.isInteger((citation as { chapterNumber?: unknown }).chapterNumber) &&
-              typeof (citation as { excerpt?: unknown }).excerpt === 'string'
-            );
+          .map((citation) => {
+            if (!citation || typeof citation !== 'object') return null;
+            const draft = citation as {
+              bookTitle?: unknown;
+              chapterLabel?: unknown;
+              chapterNumber?: unknown;
+              excerpt?: unknown;
+            };
+            if (typeof draft.bookTitle !== 'string' || typeof draft.excerpt !== 'string') {
+              return null;
+            }
+
+            const chapterLabel =
+              typeof draft.chapterLabel === 'string' && draft.chapterLabel.trim().length > 0
+                ? draft.chapterLabel.trim()
+                : Number.isInteger(draft.chapterNumber)
+                  ? `Chapter ${draft.chapterNumber}`
+                  : null;
+
+            if (!chapterLabel) return null;
+
+            return {
+              bookTitle: draft.bookTitle.trim(),
+              chapterLabel,
+              excerpt: draft.excerpt.trim(),
+            };
           })
-          .map((citation) => ({
-            bookTitle: citation.bookTitle.trim(),
-            chapterNumber: citation.chapterNumber,
-            excerpt: citation.excerpt.trim(),
-          }))
+          .filter((citation): citation is { bookTitle: string; chapterLabel: string; excerpt: string } => Boolean(citation))
       : [];
 
     return {
@@ -145,6 +161,10 @@ function normalizeAskRequest(input: AskRequest): AskRequest {
 
   if (!Number.isInteger(input.currentChapter) || input.currentChapter < 0) {
     throw new TypeError('"currentChapter" must be an integer >= 0.');
+  }
+
+  if (typeof input.currentChapterLabel !== 'string' || !input.currentChapterLabel.trim()) {
+    throw new TypeError('"currentChapterLabel" is required and must be a non-empty string.');
   }
 
   if (typeof input.question !== 'string' || !input.question.trim()) {
@@ -204,18 +224,24 @@ function normalizeAskRequest(input: AskRequest): AskRequest {
     if (!Number.isInteger(chunk.chapterNumber) || chunk.chapterNumber < 1) {
       throw new TypeError(`"chapterNumber" at chunks[${i}] must be an integer >= 1.`);
     }
+
+    if (typeof chunk.chapterLabel !== 'string' || !chunk.chapterLabel.trim()) {
+      throw new TypeError(`"chapterLabel" at chunks[${i}] must be a non-empty string.`);
+    }
   }
 
   return {
     seriesName: input.seriesName?.trim(),
     bookTitle: input.bookTitle.trim(),
     currentChapter: input.currentChapter,
+    currentChapterLabel: input.currentChapterLabel.trim(),
     completedBooks: input.completedBooks?.map((title) => title.trim()),
     question: input.question.trim(),
     chunks: input.chunks.map((chunk) => ({
       content: chunk.content.trim(),
       bookTitle: chunk.bookTitle.trim(),
       chapterNumber: chunk.chapterNumber,
+      chapterLabel: chunk.chapterLabel.trim(),
     })),
   };
 }
@@ -247,28 +273,28 @@ askRoute.post('/ask', authMiddleware, async (c) => {
     throw error;
   }
 
-  const { seriesName, bookTitle, currentChapter, completedBooks, question, chunks } = body;
+  const { seriesName, bookTitle, currentChapter, currentChapterLabel, completedBooks, question, chunks } = body;
 
   const excerpts = chunks
     .map(
       (chunk, index) =>
-        `[Excerpt ${index + 1}, ${chunk.bookTitle}, Chapter ${chunk.chapterNumber}]:\n${chunk.content}`,
+        `[Excerpt ${index + 1}, ${chunk.bookTitle}, ${chunk.chapterLabel}]:\n${chunk.content}`,
     )
     .join('\n\n---\n\n');
 
   const progressDescription =
     seriesName && completedBooks && completedBooks.length > 0
-      ? `The reader is reading the series "${seriesName}". They have completed: ${completedBooks.join(', ')}. They are currently reading "${bookTitle}" and have read up to Chapter ${currentChapter}.`
+      ? `The reader is reading the series "${seriesName}". They have completed: ${completedBooks.join(', ')}. They are currently reading "${bookTitle}" and have read up to ${currentChapterLabel}.`
       : seriesName
-        ? `The reader is reading the series "${seriesName}". They are currently on the first available book "${bookTitle}" and have read up to Chapter ${currentChapter}.`
-        : `The reader is reading "${bookTitle}" and has read up to Chapter ${currentChapter}.`;
+        ? `The reader is reading the series "${seriesName}". They are currently on the first available book "${bookTitle}" and have read up to ${currentChapterLabel}.`
+        : `The reader is reading "${bookTitle}" and has read up to ${currentChapterLabel}.`;
 
   const systemPrompt = `You are a spoiler-free reading companion. ${progressDescription}
 
 CRITICAL RULES - violating any of these is unacceptable:
 1. ONLY use the provided excerpts to answer. Do NOT use any knowledge from your training data about this book, series, or any other book.
 2. Every factual claim you make MUST be supported by at least one of the provided excerpts.
-3. Cite your sources using [Book Title, Chapter X] format inline. If all excerpts are from the same book, you may shorten to [Chapter X].
+3. Cite your sources using [Book Title, Chapter Label] format inline. If all excerpts are from the same book, you may shorten to [Chapter Label].
 4. If the excerpts do not contain enough information to fully answer the question, clearly state: "Based on what you've read so far, I don't have enough information to fully answer this."
 5. NEVER hint at, speculate about, or reference events, character developments, or plot points from chapters or books the reader has not yet reached.
 6. NEVER use phrases like "you'll find out later", "keep reading", or "this becomes important".
@@ -278,9 +304,9 @@ CRITICAL RULES - violating any of these is unacceptable:
 
 Respond in this JSON format:
 {
-  "answer": "Your answer with [Book Title, Chapter X] citations inline",
+  "answer": "Your answer with [Book Title, Chapter Label] citations inline",
   "citations": [
-    {"bookTitle": "The Way of Kings", "chapterNumber": 5, "excerpt": "brief relevant quote from the excerpt"}
+    {"bookTitle": "The Way of Kings", "chapterLabel": "Chapter 5: Bridge Four", "excerpt": "brief relevant quote from the excerpt"}
   ],
   "confidence": "high | medium | low"
 }

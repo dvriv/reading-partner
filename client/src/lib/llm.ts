@@ -3,7 +3,7 @@ import { ProviderRequestError } from './provider-error';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
 
-type AskChunk = { content: string; bookTitle: string; chapterNumber: number };
+type AskChunk = { content: string; bookTitle: string; chapterNumber: number; chapterLabel: string };
 
 async function postAsk(payload: Record<string, unknown>, authToken: string): Promise<AnswerResponse> {
   let res: Response;
@@ -30,6 +30,7 @@ export async function askSeriesQuestion(
   seriesName: string,
   currentBookTitle: string,
   currentChapter: number,
+  currentChapterLabel: string,
   completedBookTitles: string[],
   question: string,
   chunks: AskChunk[],
@@ -40,6 +41,7 @@ export async function askSeriesQuestion(
       seriesName,
       bookTitle: currentBookTitle,
       currentChapter,
+      currentChapterLabel,
       completedBooks: completedBookTitles,
       question,
       chunks
@@ -51,9 +53,10 @@ export async function askSeriesQuestion(
 export async function askBookQuestion(
   bookTitle: string,
   currentChapter: number,
+  currentChapterLabel: string,
   question: string,
   chunks: AskChunk[],
   authToken: string
 ): Promise<AnswerResponse> {
-  return postAsk({ bookTitle, currentChapter, question, chunks }, authToken);
+  return postAsk({ bookTitle, currentChapter, currentChapterLabel, question, chunks }, authToken);
 }

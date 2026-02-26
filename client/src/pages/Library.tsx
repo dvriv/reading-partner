@@ -7,6 +7,7 @@ import {
   listBooks,
   listSeries,
   offloadBookLocalContent,
+  removeNonReadyBooks,
   updateBookStatus,
   updateSeriesBookNumbering
 } from '../lib/db';
@@ -16,6 +17,7 @@ import SeriesCard from '../components/SeriesCard';
 import BookCard from '../components/BookCard';
 import CreateSeriesModal from '../components/CreateSeriesModal';
 import SettingsModal from '../components/SettingsModal';
+import { createId } from '../lib/id';
 
 interface LibraryProps {
   onSelectSeries: (seriesId: string) => void;
@@ -48,6 +50,7 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
   const [scopeFilter, setScopeFilter] = useState<'all' | 'series' | 'standalone'>('all');
 
   async function loadAll() {
+    await removeNonReadyBooks();
     const [nextSeries, nextBooks] = await Promise.all([listSeries(), listBooks()]);
     setSeries(nextSeries);
     setBooks(nextBooks);
@@ -383,7 +386,7 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
         onClose={() => setOpenCreateSeries(false)}
         onCreate={async (name) => {
           if (!name) return;
-          const nextSeriesId = crypto.randomUUID();
+          const nextSeriesId = createId();
           const db = await getDb();
           await db.put('series', {
             id: nextSeriesId,

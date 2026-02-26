@@ -52,7 +52,7 @@ let dbInstance: IDBPDatabase<ReadingPartnerDB> | null = null;
 export async function getDb(): Promise<IDBPDatabase<ReadingPartnerDB>> {
   if (dbInstance) return dbInstance;
 
-  dbInstance = await openDB<ReadingPartnerDB>('reading-partner', 3, {
+  dbInstance = await openDB<ReadingPartnerDB>('reading-partner', 4, {
     async upgrade(db, oldVersion, _newVersion, tx) {
       if (oldVersion < 1) {
         db.createObjectStore('series', { keyPath: 'id' });
@@ -100,6 +100,15 @@ export async function getDb(): Promise<IDBPDatabase<ReadingPartnerDB>> {
           await cursor.update(normalized);
           cursor = await cursor.continue();
         }
+      }
+
+      if (oldVersion < 4 && oldVersion > 0) {
+        await tx.objectStore('series').clear();
+        await tx.objectStore('books').clear();
+        await tx.objectStore('chapters').clear();
+        await tx.objectStore('chunks').clear();
+        await tx.objectStore('chatMessages').clear();
+        await tx.objectStore('searchIndexes').clear();
       }
     }
   });
@@ -270,6 +279,90 @@ export async function deleteSeries(seriesId: string): Promise<void> {
   await tx.objectStore('searchIndexes').delete(seriesId);
   await tx.objectStore('series').delete(seriesId);
   await tx.done;
+}
+
+async function forceDeleteSeriesArtifacts(seriesId: string): Promise<void> {
+  const db = await getDb();
+  const series = await db.get('series', seriesId);
+  const indexedBooks = await db.getAllFromIndex('books', 'by-series', seriesId);
+  const candidateBookIds = new Set<string>([
+    ...(series?.bookOrder ?? []),
+    ...indexedBooks.map((book) => book.id),
+  ]);
+
+  for (const bookId of candidateBookIds) {
+    await deleteBookArtifacts(bookId);
+  }
+
+  const chatKeys = await db.getAllKeysFromIndex('chatMessages', 'by-context', seriesId);
+  const tx = db.transaction(['series', 'chatMessages', 'searchIndexes'], 'readwrite');
+  for (const key of chatKeys) {
+    await tx.objectStore('chatMessages').delete(key);
+  }
+  await tx.objectStore('searchIndexes').delete(seriesId);
+  await tx.objectStore('series').delete(seriesId);
+  await tx.done;
+}
+
+export async function rollbackUploadBatch(params: {
+  createdSeriesId: string | null;
+  createdBookIds: string[];
+}): Promise<void> {
+  const { createdSeriesId, createdBookIds } = params;
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      if (createdSeriesId) {
+        await deleteSeries(createdSeriesId);
+        await forceDeleteSeriesArtifacts(createdSeriesId);
+      } else {
+        for (const bookId of [...createdBookIds].reverse()) {
+          await deleteBook(bookId);
+          await deleteBookArtifacts(bookId);
+        }
+      }
+
+      const db = await getDb();
+      if (createdSeriesId) {
+        const lingeringSeries = await db.get('series', createdSeriesId);
+        if (lingeringSeries) {
+          throw new Error(`Series rollback incomplete for ${createdSeriesId}`);
+        }
+      }
+      for (const bookId of createdBookIds) {
+        const lingeringBook = await db.get('books', bookId);
+        if (lingeringBook) {
+          throw new Error(`Book rollback incomplete for ${bookId}`);
+        }
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+
+      if (createdSeriesId) {
+        await forceDeleteSeriesArtifacts(createdSeriesId);
+      }
+
+      for (const bookId of createdBookIds) {
+        await deleteBookArtifacts(bookId);
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('Upload rollback failed.');
+}
+
+export async function removeNonReadyBooks(): Promise<number> {
+  const db = await getDb();
+  const allBooks = (await db.getAll('books')).map((book) => normalizeBookRecord(book));
+  const nonReady = allBooks.filter((book) => book.processingStatus !== 'ready');
+
+  for (const book of nonReady) {
+    await deleteBook(book.id);
+  }
+
+  return nonReady.length;
 }
 
 export async function updateSeriesBookNumbering(

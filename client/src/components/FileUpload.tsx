@@ -1,10 +1,11 @@
 import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { chunkChapter } from '../lib/chunker';
-import { deleteBook, deleteSeries, getDb, recomputeSeriesProgression } from '../lib/db';
-import { parseEpub } from '../lib/epub-parser';
+import { deleteBook, deleteSeries, getDb, recomputeSeriesProgression, updateBookMetadata } from '../lib/db';
+import { parseEpub, parseEpubMetadata } from '../lib/epub-parser';
 import { defaultIngestionMetadata } from '../lib/ingestion-state';
 import { formatIngestionLabel, resumeBookIngestion } from '../lib/ingestion';
 import { createId } from '../lib/id';
+import { lookupOpenLibraryMetadata } from '../lib/openlibrary';
 import { isProviderRequestError } from '../lib/provider-error';
 import type { Book, IngestionMetadata, Series } from '../types';
 
@@ -23,7 +24,23 @@ interface FileUploadProps {
 interface UploadQueueItem {
   id: string;
   file: File;
-  bookNumber: number;
+}
+
+interface MetadataRow {
+  queueId: string;
+  fileName: string;
+  fetchState: 'pending' | 'done' | 'failed';
+  confidence: string | null;
+  bookId: string | null;
+  title: string;
+  author: string;
+  isbn: string;
+  publicationYear: string;
+  seriesName: string;
+  seriesOrder: string;
+  manualSeriesOrder: boolean;
+  apiCoverUrl: string | null;
+  coverSource: 'epub' | 'openlibrary' | 'none';
 }
 
 export default function FileUpload({
@@ -42,8 +59,11 @@ export default function FileUpload({
   const [selectedSeriesId, setSelectedSeriesId] = useState<string>('');
   const [newSeriesName, setNewSeriesName] = useState('');
   const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
+  const [metadataRows, setMetadataRows] = useState<MetadataRow[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [uploadFinished, setUploadFinished] = useState(false);
   const [modalProgress, setModalProgress] = useState<number>(0);
+  const [metadataStatus, setMetadataStatus] = useState<string | null>(null);
   const [isDragActive, setIsDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
@@ -61,7 +81,10 @@ export default function FileUpload({
     setError(null);
     setLoadingLabel(null);
     setModalProgress(0);
+    setMetadataStatus(null);
     setUploadQueue([]);
+    setMetadataRows([]);
+    setUploadFinished(false);
     setNewSeriesName('');
 
     if (!preferredSeriesId) {
@@ -102,26 +125,10 @@ export default function FileUpload({
     }
 
     if (filtered.length > 0) {
-      setUploadQueue((prev) => {
-        const suggestedStart = mode === 'existing-series' && selectedSeriesId
-          ? getSuggestedBookNumber(selectedSeriesId, books)
-          : 1;
-        let nextBookNumber = mode === 'standalone'
-          ? 1
-          : prev.length > 0
-            ? Math.max(...prev.map((item) => item.bookNumber)) + 1
-            : suggestedStart;
-        const nextItems = filtered.map((file) => {
-          const next: UploadQueueItem = {
-            id: createId(),
-            file,
-            bookNumber: nextBookNumber,
-          };
-          nextBookNumber += 1;
-          return next;
-        });
-        return [...prev, ...nextItems];
-      });
+      setUploadQueue((prev) => [
+        ...prev,
+        ...filtered.map((file) => ({ id: createId(), file })),
+      ]);
     }
 
   }
@@ -173,14 +180,7 @@ export default function FileUpload({
 
   function removeFromQueue(queueItemId: string) {
     setUploadQueue((prev) => prev.filter((item) => item.id !== queueItemId));
-  }
-
-  function updateQueueBookNumber(queueItemId: string, nextValue: number) {
-    setUploadQueue((prev) => prev.map((item) => (
-      item.id === queueItemId
-        ? { ...item, bookNumber: Math.max(1, Math.floor(nextValue) || 1) }
-        : item
-    )));
+    setMetadataRows((prev) => recomputeSuggestedSeriesOrder(prev.filter((item) => item.queueId !== queueItemId)));
   }
 
   function toOverallProgress(currentFile: number, totalFiles: number, perFileProgress: number): number {
@@ -188,32 +188,6 @@ export default function FileUpload({
     return Math.round((((currentFile - 1) + safePerFile / 100) / Math.max(1, totalFiles)) * 100);
   }
 
-  function validateSeriesQueue(
-    queue: UploadQueueItem[],
-    existingSeriesBooks: Book[]
-  ): string | null {
-    if (queue.length === 0) {
-      return 'Select at least one EPUB file.';
-    }
-
-    const numbers = queue.map((item) => item.bookNumber);
-    if (numbers.some((value) => !Number.isInteger(value) || value < 1)) {
-      return 'Series order must use whole numbers starting at 1.';
-    }
-
-    const unique = new Set(numbers);
-    if (unique.size !== numbers.length) {
-      return 'Each queued file must have a unique series order number.';
-    }
-
-    const existingNumbers = new Set(existingSeriesBooks.map((book) => book.bookNumber).filter((value): value is number => typeof value === 'number'));
-    const conflict = numbers.find((value) => existingNumbers.has(value));
-    if (typeof conflict === 'number') {
-      return `Book number ${conflict} already exists in this series.`;
-    }
-
-    return null;
-  }
 
   function throwIfCancelled() {
     if (cancelRequestedRef.current || activeAbortControllerRef.current?.signal.aborted) {
@@ -223,6 +197,10 @@ export default function FileUpload({
 
   function requestCancel() {
     if (!isProcessing) {
+      if (uploadFinished) {
+        void persistDraftsAndClose();
+        return;
+      }
       onClose();
       return;
     }
@@ -232,8 +210,141 @@ export default function FileUpload({
     setLoadingLabel('Cancelling upload...');
   }
 
+  function setRow(queueId: string, updater: (current: MetadataRow) => MetadataRow) {
+    setMetadataRows((prev) => recomputeSuggestedSeriesOrder(prev.map((row) => (row.queueId === queueId ? updater(row) : row))));
+  }
+
+  function upsertRow(row: MetadataRow) {
+    setMetadataRows((prev) => {
+      const existingIndex = prev.findIndex((item) => item.queueId === row.queueId);
+      if (existingIndex === -1) return recomputeSuggestedSeriesOrder([...prev, row]);
+      const next = [...prev];
+      next[existingIndex] = row;
+      return recomputeSuggestedSeriesOrder(next);
+    });
+  }
+
+  function updateRowField(queueId: string, field: 'title' | 'author' | 'isbn' | 'publicationYear' | 'seriesName' | 'seriesOrder', value: string) {
+    setRow(queueId, (current) => {
+      if (field === 'seriesOrder') {
+        return { ...current, seriesOrder: value, manualSeriesOrder: true };
+      }
+      return { ...current, [field]: value };
+    });
+  }
+
+  function resolveCoverSource(epubCoverUrl: string | null, apiCoverUrl: string | null): 'epub' | 'openlibrary' | 'none' {
+    if (epubCoverUrl) return 'epub';
+    if (apiCoverUrl) return 'openlibrary';
+    return 'none';
+  }
+
+  function recomputeSuggestedSeriesOrder(rows: MetadataRow[]): MetadataRow[] {
+    const next = rows.map((row) => ({ ...row }));
+    const grouped = new Map<string, MetadataRow[]>();
+
+    for (const row of next) {
+      const key = row.seriesName.trim().toLowerCase();
+      if (!key) continue;
+      const list = grouped.get(key) ?? [];
+      list.push(row);
+      grouped.set(key, list);
+    }
+
+    for (const list of grouped.values()) {
+      const needsInference = list.filter((row) => !row.manualSeriesOrder || !row.seriesOrder.trim());
+      if (needsInference.length === 0) continue;
+
+      const ordered = [...list].sort((a, b) => {
+        const yearA = Number.parseInt(a.publicationYear, 10);
+        const yearB = Number.parseInt(b.publicationYear, 10);
+        const hasA = Number.isFinite(yearA);
+        const hasB = Number.isFinite(yearB);
+        if (hasA && hasB && yearA !== yearB) return yearA - yearB;
+        if (hasA !== hasB) return hasA ? -1 : 1;
+        return a.title.localeCompare(b.title);
+      });
+
+      const occupied = new Set<number>();
+      for (const row of list) {
+        if (!row.manualSeriesOrder) continue;
+        const parsed = Number.parseInt(row.seriesOrder, 10);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          occupied.add(parsed);
+        }
+      }
+
+      let nextNumber = 1;
+      for (const row of ordered) {
+        if (row.manualSeriesOrder && row.seriesOrder.trim()) continue;
+        while (occupied.has(nextNumber)) {
+          nextNumber += 1;
+        }
+        row.seriesOrder = String(nextNumber);
+        nextNumber += 1;
+      }
+    }
+
+    return next;
+  }
+
+  async function persistDraftsAndClose() {
+    const rowsToPersist = recomputeSuggestedSeriesOrder(metadataRows);
+
+    for (const row of rowsToPersist) {
+      if (!row.bookId) continue;
+      const parsedSeriesOrder = Number.parseInt(row.seriesOrder, 10);
+      const parsedPublicationYear = Number.parseInt(row.publicationYear, 10);
+      const coverPatch =
+        row.coverSource === 'openlibrary' && row.apiCoverUrl
+          ? { coverUrl: row.apiCoverUrl }
+          : row.coverSource === 'none'
+            ? { coverUrl: null as string | null }
+            : {};
+
+      if (import.meta.env.DEV) {
+        console.info('[upload-metadata] persisting row metadata', {
+          bookId: row.bookId,
+          title: row.title,
+          coverSource: row.coverSource,
+          hasApiCover: Boolean(row.apiCoverUrl),
+          coverUrlPersisted: 'coverUrl' in coverPatch ? coverPatch.coverUrl : '(unchanged)',
+        });
+      }
+
+      const result = await updateBookMetadata(row.bookId, {
+        title: row.title,
+        author: row.author,
+        isbn: row.isbn.trim() ? row.isbn.trim() : null,
+        publicationYear: Number.isFinite(parsedPublicationYear) ? parsedPublicationYear : null,
+        seriesName: row.seriesName.trim() ? row.seriesName.trim() : null,
+        seriesOrder: Number.isFinite(parsedSeriesOrder) && parsedSeriesOrder > 0 ? parsedSeriesOrder : null,
+        ...coverPatch,
+      });
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+    }
+
+    await onComplete();
+    setMetadataRows([]);
+    setUploadQueue([]);
+    setUploadFinished(false);
+    onClose();
+  }
+
   async function ingestParsedBook(
-    parsedBook: { title: string; author: string; chapters: Array<{ chapterNumber: number; title: string; text: string }> },
+    parsedBook: {
+      title: string;
+      author: string;
+      isbn: string | null;
+      publicationYear: number | null;
+      coverUrl: string | null;
+      externalSeriesName: string | null;
+      externalSeriesOrder: number | null;
+      chapters: Array<{ chapterNumber: number; title: string; text: string }>;
+    },
     assignment: { seriesId: string | null; finalBookNumber: number | null; status: Book['status'] },
     progressContext: { currentFile: number; totalFiles: number }
   ): Promise<string> {
@@ -278,6 +389,11 @@ export default function FileUpload({
         id: bookId,
         title: parsedBook.title,
         author: parsedBook.author,
+        isbn: parsedBook.isbn,
+        publicationYear: parsedBook.publicationYear,
+        coverUrl: parsedBook.coverUrl,
+        externalSeriesName: parsedBook.externalSeriesName,
+        externalSeriesOrder: parsedBook.externalSeriesOrder,
         totalChapters: parsedBook.chapters.length,
         currentChapter: 0,
         processingStatus: 'processing',
@@ -392,6 +508,7 @@ export default function FileUpload({
     }
 
     setError(null);
+    setUploadFinished(false);
     setIsProcessing(true);
     cancelRequestedRef.current = false;
     activeAbortControllerRef.current = new AbortController();
@@ -404,26 +521,100 @@ export default function FileUpload({
     try {
       const db = await getDb();
       let resolvedSeriesId: string | null = null;
+      let resolvedSeriesName: string | null = null;
 
       if (mode === 'existing-series') {
         resolvedSeriesId = selectedSeriesId;
-
-        const existingSeriesBooks = books.filter((book) => book.seriesId === resolvedSeriesId);
-        const queueError = validateSeriesQueue(queue, existingSeriesBooks);
-        if (queueError) {
-          throw new Error(queueError);
-        }
+        resolvedSeriesName = series.find((item) => item.id === selectedSeriesId)?.name ?? null;
       }
 
       if (mode === 'new-series') {
-        const queueError = validateSeriesQueue(queue, []);
-        if (queueError) {
-          throw new Error(queueError);
-        }
+        resolvedSeriesName = newSeriesName.trim();
       }
 
-      if (mode !== 'standalone') {
-        queue = [...queue].sort((a, b) => a.bookNumber - b.bookNumber);
+      setMetadataRows(queue.map((item) => ({
+        queueId: item.id,
+        fileName: item.file.name,
+        fetchState: 'pending',
+        confidence: null,
+        bookId: null,
+        title: item.file.name.replace(/\.epub$/i, ''),
+        author: 'Unknown Author',
+        isbn: '',
+        publicationYear: '',
+        seriesName: resolvedSeriesName ?? '',
+        seriesOrder: '',
+        manualSeriesOrder: false,
+        apiCoverUrl: null,
+        coverSource: 'none',
+      })));
+
+      for (const queueItem of queue) {
+        void (async () => {
+          try {
+            const parsed = await parseEpubMetadata(queueItem.file);
+            setRow(queueItem.id, (current) => ({
+              ...current,
+              title: parsed.title,
+              author: parsed.author,
+              isbn: current.isbn || parsed.isbns[0] || '',
+              publicationYear: current.publicationYear || (parsed.publicationYear ? String(parsed.publicationYear) : ''),
+              coverSource: resolveCoverSource(null, current.apiCoverUrl),
+            }));
+
+            if (import.meta.env.DEV) {
+              console.info('[upload-metadata] parsed epub metadata', {
+                fileName: queueItem.file.name,
+                title: parsed.title,
+                hasApiCoverAtParseStep: false,
+              });
+            }
+
+            const metadata = await lookupOpenLibraryMetadata(parsed.title, parsed.author, parsed.isbns);
+            if (!metadata) {
+              setRow(queueItem.id, (current) => ({ ...current, fetchState: 'failed', confidence: null }));
+              if (import.meta.env.DEV) {
+                console.info('[upload-metadata] openlibrary cover missing', {
+                  fileName: queueItem.file.name,
+                  source: 'none',
+                });
+              }
+              return;
+            }
+
+            const canOverrideIdentity = metadata.confidence === 'exact_isbn' || metadata.confidence === 'high';
+            const mergedPublicationYear =
+              typeof metadata.publicationYear === 'number' && Number.isFinite(metadata.publicationYear)
+                ? String(Math.floor(metadata.publicationYear))
+                : '';
+
+            setRow(queueItem.id, (current) => {
+              const nextApiCover = metadata.coverUrl ?? null;
+              return {
+                ...current,
+                fetchState: 'done',
+                confidence: metadata.confidence,
+                title: canOverrideIdentity ? metadata.title : current.title,
+                author: canOverrideIdentity ? metadata.author : current.author,
+                publicationYear: current.publicationYear || mergedPublicationYear,
+                seriesName: current.seriesName || metadata.seriesName || '',
+                apiCoverUrl: nextApiCover,
+                coverSource: resolveCoverSource(null, nextApiCover),
+              };
+            });
+
+            if (import.meta.env.DEV) {
+              console.info('[upload-metadata] openlibrary metadata resolved', {
+                fileName: queueItem.file.name,
+                confidence: metadata.confidence,
+                hasApiCover: Boolean(metadata.coverUrl),
+                source: metadata.coverUrl ? 'openlibrary' : 'none',
+              });
+            }
+          } catch {
+            setRow(queueItem.id, (current) => ({ ...current, fetchState: 'failed', confidence: null }));
+          }
+        })();
       }
 
       for (let index = 0; index < queue.length; index += 1) {
@@ -447,20 +638,41 @@ export default function FileUpload({
         setLoadingLabel(`Parsing ${index + 1}/${queue.length}: ${queueItem.file.name}`);
         setModalProgress(toOverallProgress(index + 1, queue.length, 3));
         const parsedBook = await parseEpub(queueItem.file);
+        setRow(queueItem.id, (current) => {
+          const nextSource = resolveCoverSource(parsedBook.coverUrl, current.apiCoverUrl);
+          if (import.meta.env.DEV) {
+            console.info('[upload-metadata] final cover source selected', {
+              fileName: queueItem.file.name,
+              hasEpubCover: Boolean(parsedBook.coverUrl),
+              hasApiCover: Boolean(current.apiCoverUrl),
+              coverSource: nextSource,
+            });
+          }
+          return {
+            ...current,
+            coverSource: nextSource,
+          };
+        });
+        setLoadingLabel(`Uploading ${index + 1}/${queue.length}: ${parsedBook.title}`);
+
+        const bookWithMetadata = {
+          ...parsedBook,
+          title: parsedBook.title,
+          author: parsedBook.author,
+          isbn: parsedBook.isbns[0] ?? null,
+          publicationYear: parsedBook.publicationYear,
+          coverUrl: parsedBook.coverUrl,
+          externalSeriesName: null,
+          externalSeriesOrder: null,
+        };
         throwIfCancelled();
 
         let status: Book['status'] = 'reading';
         let finalBookNumber: number | null = null;
 
         if (resolvedSeriesId) {
-          finalBookNumber = queueItem.bookNumber;
-          const seriesBooks = (await db.getAllFromIndex('books', 'by-series', resolvedSeriesId)).sort(
-            (a, b) => (a.bookNumber ?? 9999) - (b.bookNumber ?? 9999)
-          );
-
-          if (seriesBooks.some((book) => (book.bookNumber ?? 0) === finalBookNumber)) {
-            throw new Error(`Book number ${finalBookNumber} already exists in this series.`);
-          }
+          const seriesBooks = (await db.getAllFromIndex('books', 'by-series', resolvedSeriesId)).sort((a, b) => (a.bookNumber ?? 9999) - (b.bookNumber ?? 9999));
+          finalBookNumber = seriesBooks.length + 1;
 
           const priorBooks = seriesBooks.filter((book) => (book.bookNumber ?? 0) < (finalBookNumber ?? 1));
           status = priorBooks.length === 0
@@ -471,7 +683,7 @@ export default function FileUpload({
         }
 
         const createdBookId = await ingestParsedBook(
-          parsedBook,
+          bookWithMetadata,
           {
             seriesId: resolvedSeriesId,
             finalBookNumber,
@@ -483,15 +695,13 @@ export default function FileUpload({
           }
         );
         createdBookIds.push(createdBookId);
+        setRow(queueItem.id, (current) => ({ ...current, bookId: createdBookId }));
         failedQueueItem = null;
       }
 
       setModalProgress(100);
-      if (createdBookIds.length > 0) {
-        await onComplete();
-      }
-      setUploadQueue([]);
-      onClose();
+      setUploadFinished(true);
+      setMetadataStatus('Upload complete. Review metadata and close to save changes.');
     } catch (err) {
       console.error('File upload batch failed', {
         error: err,
@@ -501,7 +711,6 @@ export default function FileUpload({
         queuedFiles: uploadQueue.map((item) => ({
           name: item.file.name,
           size: item.file.size,
-          order: item.bookNumber,
         })),
         createdSeriesId,
         createdBookIds,
@@ -528,17 +737,23 @@ export default function FileUpload({
         (err instanceof Error && err.message === CANCELLED_UPLOAD) ||
         (isProviderRequestError(err) && err.code === 'embed_cancelled')
       ) {
+        setMetadataRows([]);
+        setUploadQueue([]);
+        setUploadFinished(false);
         setError(
           failedName
             ? `Upload cancelled while processing ${failedName}. Completed books were kept.`
             : 'Upload cancelled. Completed books were kept.'
         );
+        if (createdBookIds.length > 0) {
+          await onComplete();
+        }
+        onClose();
+        return;
       } else if (
         err instanceof Error &&
         (
-          err.message.startsWith('Book number') ||
           err.message.startsWith('Series order') ||
-          err.message.startsWith('Each queued file') ||
           err.message.startsWith('Select at least one EPUB file.') ||
           err.message.startsWith('Complete assignment settings')
         )
@@ -583,7 +798,7 @@ export default function FileUpload({
           <div>
             <h2 className="text-2xl font-semibold">Add Books</h2>
             <p className="mt-1 text-sm text-[var(--ink-secondary)]">
-              Queue multiple EPUB files and assign their series order before uploading.
+              Queue multiple EPUB files. Metadata and series order can be edited while upload runs. Only DRM-free English EPUB files are supported.
             </p>
           </div>
           <button className="rp-btn rp-btn-secondary" onClick={requestCancel}>
@@ -600,7 +815,7 @@ export default function FileUpload({
                 <input
                   type="radio"
                   checked={mode === 'standalone'}
-                  disabled={isProcessing}
+                  disabled={isProcessing || uploadFinished}
                   onChange={() => setMode('standalone')}
                 />
                 Standalone book(s)
@@ -611,7 +826,7 @@ export default function FileUpload({
                   <input
                     type="radio"
                     checked={mode === 'existing-series'}
-                    disabled={isProcessing}
+                    disabled={isProcessing || uploadFinished}
                     onChange={() => setMode('existing-series')}
                   />
                   Add to existing series
@@ -621,7 +836,7 @@ export default function FileUpload({
                     <select
                       className="rp-select"
                       value={selectedSeriesId}
-                      disabled={isProcessing}
+                      disabled={isProcessing || uploadFinished}
                       onChange={(event) => {
                         const nextSeriesId = event.target.value;
                         setSelectedSeriesId(nextSeriesId);
@@ -643,7 +858,7 @@ export default function FileUpload({
                   <input
                     type="radio"
                     checked={mode === 'new-series'}
-                    disabled={isProcessing}
+                    disabled={isProcessing || uploadFinished}
                     onChange={() => setMode('new-series')}
                   />
                   Create new series
@@ -652,7 +867,7 @@ export default function FileUpload({
                   <div className="mt-2 ml-6 grid gap-2">
                     <input
                       value={newSeriesName}
-                      disabled={isProcessing}
+                      disabled={isProcessing || uploadFinished}
                       onChange={(event) => setNewSeriesName(event.target.value)}
                       placeholder="Series name"
                       className="rp-field"
@@ -676,7 +891,7 @@ export default function FileUpload({
 
             <button
               className="rp-btn rp-btn-secondary mt-3 w-full"
-              disabled={isProcessing}
+              disabled={isProcessing || uploadFinished}
               onClick={chooseFiles}
             >
               Choose EPUB file(s)
@@ -697,34 +912,111 @@ export default function FileUpload({
                         <button
                           type="button"
                           className="text-xs font-medium text-[var(--ink-tertiary)] hover:text-[var(--danger-ink)]"
-                          disabled={isProcessing}
+                          disabled={isProcessing || uploadFinished}
                           onClick={() => removeFromQueue(item.id)}
                         >
                           Remove
                         </button>
                       </div>
-                      {mode !== 'standalone' ? (
-                        <div className="mt-2 flex items-center gap-2">
-                          <label className="text-xs font-medium text-[var(--ink-tertiary)]">Series order</label>
-                          <input
-                            type="number"
-                            min={1}
-                            value={item.bookNumber}
-                            disabled={isProcessing}
-                            onChange={(event) => updateQueueBookNumber(item.id, Number(event.target.value) || 1)}
-                            className="rp-field h-9 w-24"
-                          />
-                        </div>
-                      ) : null}
                     </div>
                   ))}
                 </div>
               )}
             </div>
 
+            {metadataRows.length > 0 ? (
+              <div className="mt-3 overflow-x-auto rounded-[var(--radius-sm)] border border-[var(--line-subtle)] bg-[var(--bg-elevated)] p-3">
+                <table className="min-w-full text-left text-xs">
+                  <thead>
+                    <tr className="text-[var(--ink-tertiary)]">
+                      <th className="px-2 py-1">Name</th>
+                      <th className="px-2 py-1">Author</th>
+                      <th className="px-2 py-1">ISBN</th>
+                      <th className="px-2 py-1">Publication Year</th>
+                      <th className="px-2 py-1">Series</th>
+                      <th className="px-2 py-1">Series order</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {metadataRows.map((row) => {
+                      const locked = row.fetchState === 'pending';
+                      return (
+                        <tr key={row.queueId} className="align-top">
+                          <td className="px-2 py-1">
+                            <input
+                              className="rp-field h-9 min-w-[180px]"
+                              value={row.title}
+                              disabled={locked}
+                              onChange={(event) => updateRowField(row.queueId, 'title', event.target.value)}
+                            />
+                          </td>
+                          <td className="px-2 py-1">
+                            <input
+                              className="rp-field h-9 min-w-[150px]"
+                              value={row.author}
+                              disabled={locked}
+                              onChange={(event) => updateRowField(row.queueId, 'author', event.target.value)}
+                            />
+                          </td>
+                          <td className="px-2 py-1">
+                            <input
+                              className="rp-field h-9 min-w-[140px]"
+                              value={row.isbn}
+                              disabled={locked}
+                              onChange={(event) => updateRowField(row.queueId, 'isbn', event.target.value)}
+                            />
+                          </td>
+                          <td className="px-2 py-1">
+                            <input
+                              type="number"
+                              min={1400}
+                              max={2500}
+                              className="rp-field h-9 w-28"
+                              value={row.publicationYear}
+                              disabled={locked}
+                              onChange={(event) => updateRowField(row.queueId, 'publicationYear', event.target.value)}
+                            />
+                          </td>
+                          <td className="px-2 py-1">
+                            <input
+                              className="rp-field h-9 min-w-[150px]"
+                              value={row.seriesName}
+                              disabled={locked}
+                              onChange={(event) => updateRowField(row.queueId, 'seriesName', event.target.value)}
+                            />
+                          </td>
+                          <td className="px-2 py-1">
+                            <input
+                              type="number"
+                              min={1}
+                              className="rp-field h-9 w-24"
+                              value={row.seriesOrder}
+                              disabled={locked}
+                              onChange={(event) => updateRowField(row.queueId, 'seriesOrder', event.target.value)}
+                            />
+                            <p className="mt-1 text-[10px] text-[var(--ink-tertiary)]">
+                              {row.fetchState === 'pending'
+                                ? 'Fetching metadata...'
+                                : row.fetchState === 'failed'
+                                  ? 'Using EPUB defaults'
+                                  : row.confidence
+                                    ? row.confidence.toUpperCase()
+                                    : 'Ready'}
+                            </p>
+                            <p className="text-[10px] text-[var(--ink-tertiary)]">Cover: {row.coverSource === 'openlibrary' ? 'Open Library' : row.coverSource === 'epub' ? 'EPUB' : 'None'}</p>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+
             {isProcessing ? (
               <div className="mt-3 rounded-[var(--radius-sm)] border border-[var(--line-subtle)] bg-[var(--bg-elevated)] p-3" aria-live="polite">
                 <p className="text-sm font-medium text-[var(--text-primary)]">{loadingLabel ?? 'Processing...'}</p>
+                {metadataStatus ? <p className="mt-1 text-xs text-[var(--ink-secondary)]">{metadataStatus}</p> : null}
                 <div className="mt-2 flex items-center gap-3">
                   <progress className="h-2 w-full" value={modalProgress} max={100} />
                   <span className="w-12 text-right text-xs font-semibold text-[var(--accent)]">{modalProgress}%</span>
@@ -738,7 +1030,13 @@ export default function FileUpload({
         <div className="mt-5 flex items-center justify-between gap-2">
           {error ? <p className="text-sm text-[var(--danger)]" role="alert">{error}</p> : <span />}
           <div className="flex justify-end gap-2">
-          <button type="button" className="rp-btn rp-btn-secondary" disabled={isProcessing} onClick={onClose}>
+          <button type="button" className="rp-btn rp-btn-secondary" disabled={isProcessing} onClick={() => {
+            if (uploadFinished) {
+              void persistDraftsAndClose();
+              return;
+            }
+            onClose();
+          }}>
             Close
           </button>
           {isProcessing ? (
@@ -748,23 +1046,15 @@ export default function FileUpload({
           ) : null}
           <button
             type="button"
-            disabled={isProcessing || !canAssign || uploadQueue.length === 0}
+            disabled={isProcessing || uploadFinished || !canAssign || uploadQueue.length === 0}
             className="rp-btn rp-btn-primary"
             onClick={() => void processFiles()}
           >
-            {isProcessing ? 'Uploading...' : error ? 'Retry Upload' : uploadQueue.length > 1 ? 'Add Books' : 'Add Book'}
+            {isProcessing ? 'Uploading...' : uploadFinished ? 'Upload Complete' : error ? 'Retry Upload' : uploadQueue.length > 1 ? 'Add Books' : 'Add Book'}
           </button>
           </div>
         </div>
       </div>
     </div>
   );
-}
-
-function getSuggestedBookNumber(seriesId: string, books: Book[]): number {
-  const existing = books
-    .filter((book) => book.seriesId === seriesId)
-    .map((book) => book.bookNumber ?? 0);
-  const maxNumber = existing.length > 0 ? Math.max(...existing) : 0;
-  return Math.max(1, maxNumber + 1);
 }

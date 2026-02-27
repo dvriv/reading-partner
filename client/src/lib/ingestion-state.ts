@@ -60,6 +60,11 @@ export function normalizeIngestionMetadata(
 export function normalizeBookRecord(book: Book): Book {
   return {
     ...book,
+    isbn: book.isbn ?? null,
+    publicationYear: typeof book.publicationYear === 'number' ? book.publicationYear : null,
+    coverUrl: book.coverUrl ?? null,
+    externalSeriesName: book.externalSeriesName ?? null,
+    externalSeriesOrder: typeof book.externalSeriesOrder === 'number' ? book.externalSeriesOrder : null,
     hasLocalContent: book.hasLocalContent ?? true,
     ingestion: normalizeIngestionMetadata(book.processingStatus, book.ingestion, book.createdAt),
   };

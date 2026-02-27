@@ -6,8 +6,8 @@ import {
   getDb,
   listBooks,
   listSeries,
-  offloadBookLocalContent,
   removeNonReadyBooks,
+  updateBookMetadata,
   updateBookStatus,
   updateSeriesBookNumbering
 } from '../lib/db';
@@ -17,6 +17,7 @@ import SeriesCard from '../components/SeriesCard';
 import BookCard from '../components/BookCard';
 import CreateSeriesModal from '../components/CreateSeriesModal';
 import SettingsModal from '../components/SettingsModal';
+import EditBookMetadataModal from '../components/EditBookMetadataModal';
 import { createId } from '../lib/id';
 
 interface LibraryProps {
@@ -35,6 +36,7 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
   const [openSettingsModal, setOpenSettingsModal] = useState(false);
   const [uploadTargetSeriesId, setUploadTargetSeriesId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [editingBookId, setEditingBookId] = useState<string | null>(null);
   const [collapsedSeriesIds, setCollapsedSeriesIds] = useState<Set<string>>(() => {
     if (typeof window === 'undefined') return new Set<string>();
     const raw = window.localStorage.getItem('reading-partner:collapsed-series');
@@ -48,12 +50,37 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | Book['status']>('all');
   const [scopeFilter, setScopeFilter] = useState<'all' | 'series' | 'standalone'>('all');
+  const [dataUsageLabel, setDataUsageLabel] = useState('Storage used: calculating...');
+
+  function formatBytes(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    const rounded = value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1);
+    return `${rounded} ${units[unitIndex]}`;
+  }
+
+  async function refreshDataUsageLabel() {
+    if (!navigator.storage?.estimate) {
+      setDataUsageLabel('Storage used: unavailable');
+      return;
+    }
+    const estimate = await navigator.storage.estimate();
+    const usedBytes = estimate.usage ?? 0;
+    setDataUsageLabel(`Storage used: ${formatBytes(usedBytes)}`);
+  }
 
   async function loadAll() {
     await removeNonReadyBooks();
     const [nextSeries, nextBooks] = await Promise.all([listSeries(), listBooks()]);
     setSeries(nextSeries);
     setBooks(nextBooks);
+    await refreshDataUsageLabel();
   }
 
   useEffect(() => {
@@ -101,6 +128,10 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
     [standaloneBooks, filteredBookIds]
   );
   const isEmptyLibrary = series.length === 0 && readyBooks.length === 0;
+  const editingBook = editingBookId ? readyBooks.find((book) => book.id === editingBookId) ?? null : null;
+  const editingSeriesName = editingBook?.seriesId
+    ? series.find((item) => item.id === editingBook.seriesId)?.name ?? ''
+    : '';
 
   return (
     <>
@@ -111,6 +142,7 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
           <p className="mt-1 text-sm text-[var(--ink-secondary)]">Library and progression ledger</p>
         </div>
         <div className="flex items-center gap-3">
+          <span className="text-xs text-[var(--ink-secondary)]">{dataUsageLabel}</span>
           <button
             type="button"
             className="inline-flex h-10 w-10 items-center justify-center rounded-full text-[var(--ink-muted)] transition hover:bg-[var(--paper-surface)]"
@@ -129,6 +161,14 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
         open={openSettingsModal}
         accessToken={authToken}
         onClose={() => setOpenSettingsModal(false)}
+        onLocalDataDeleted={async () => {
+          setCollapsedSeriesIds(new Set());
+          setEditingBookId(null);
+          setUploadTargetSeriesId(null);
+          setOpenUploadModal(false);
+          setOpenCreateSeries(false);
+          await loadAll();
+        }}
         onAccountDeleted={onLogout}
       />
 
@@ -141,6 +181,31 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
         onClose={() => setOpenUploadModal(false)}
         onComplete={async () => {
           setUploadTargetSeriesId(null);
+          await loadAll();
+        }}
+      />
+
+      <EditBookMetadataModal
+        open={Boolean(editingBook)}
+        book={editingBook}
+        defaultSeriesName={editingSeriesName}
+        onClose={() => setEditingBookId(null)}
+        onSave={async (payload) => {
+          if (!editingBook) return;
+          const parsedOrder = Number.parseInt(payload.seriesOrder, 10);
+          const parsedPublicationYear = Number.parseInt(payload.publicationYear, 10);
+          const result = await updateBookMetadata(editingBook.id, {
+            title: payload.title,
+            author: payload.author,
+            isbn: payload.isbn.trim() ? payload.isbn.trim() : null,
+            publicationYear: Number.isFinite(parsedPublicationYear) ? parsedPublicationYear : null,
+            coverUrl: payload.coverUrl,
+            seriesName: payload.seriesName.trim() ? payload.seriesName.trim() : null,
+            seriesOrder: Number.isFinite(parsedOrder) && parsedOrder > 0 ? parsedOrder : null,
+          });
+          if (!result.ok) {
+            throw new Error(result.error);
+          }
           await loadAll();
         }}
       />
@@ -216,7 +281,7 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
               >
                 Add Your First Book
               </button>
-              <p className="mt-4 text-sm text-[var(--ink-tertiary)]">Currently only possible to upload DRM free epub files.</p>
+              <p className="mt-4 text-sm text-[var(--ink-tertiary)]">Currently only possible to upload DRM-free English EPUB files.</p>
             </div>
           </div>
         </section>
@@ -267,20 +332,6 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
                   await loadAll();
                 })();
               }}
-              onOffloadBook={(book) => {
-                const confirmation = window.confirm(
-                  `Clear local text for "${book.title}" to free space? Chat history and reading status are preserved.`
-                );
-                if (!confirmation) return;
-                void (async () => {
-                  const result = await offloadBookLocalContent(book.id);
-                  if (!result.ok) {
-                    setActionError(result.error);
-                    return;
-                  }
-                  await loadAll();
-                })();
-              }}
               onSetBookStatus={(book, status) => {
                 void (async () => {
                   const result = await updateBookStatus(book.id, status);
@@ -299,6 +350,7 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
               }}
               collapsed={collapsedSeriesIds.has(item.id)}
               hasReadingBook={hasReadingBook}
+              onEditBook={(book) => setEditingBookId(book.id)}
               onToggleCollapsed={() => {
                 setCollapsedSeriesIds((prev) => {
                   const isCollapsed = prev.has(item.id);
@@ -325,7 +377,8 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
             <BookCard
               key={book.id}
               book={book}
-              onOpen={() => onSelectBook(book.id)}
+              onOpen={() => setEditingBookId(book.id)}
+              onOpenChat={() => onSelectBook(book.id)}
               onDelete={() => {
                 const confirmation = window.confirm(`Delete "${book.title}"? This cannot be undone.`);
                 if (!confirmation) return;
@@ -337,20 +390,6 @@ export default function Library({ onSelectSeries, onSelectBook, onLogout, authTo
               onSetStatus={(status) => {
                 void (async () => {
                   const result = await updateBookStatus(book.id, status);
-                  if (!result.ok) {
-                    setActionError(result.error);
-                    return;
-                  }
-                  await loadAll();
-                })();
-              }}
-              onOffload={() => {
-                const confirmation = window.confirm(
-                  `Clear local text for "${book.title}" to free space? Chat history and reading status are preserved.`
-                );
-                if (!confirmation) return;
-                void (async () => {
-                  const result = await offloadBookLocalContent(book.id);
                   if (!result.ok) {
                     setActionError(result.error);
                     return;

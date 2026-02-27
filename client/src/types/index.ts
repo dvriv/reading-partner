@@ -22,6 +22,11 @@ export interface Book {
   id: string;
   title: string;
   author: string;
+  isbn?: string | null;
+  publicationYear?: number | null;
+  coverUrl?: string | null;
+  externalSeriesName?: string | null;
+  externalSeriesOrder?: number | null;
   totalChapters: number;
   currentChapter: number;
   processingStatus: ProcessingStatus;

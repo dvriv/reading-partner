@@ -1,6 +1,7 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import type { Book, Chapter, ChatMessage, Chunk, Series } from '../types';
 import { normalizeBookRecord } from './ingestion-state';
+import { createId } from './id';
 import { recomputeSeriesStatuses, validateSeriesBookNumbers } from './series-order';
 
 interface ReadingPartnerDB extends DBSchema {
@@ -52,7 +53,7 @@ let dbInstance: IDBPDatabase<ReadingPartnerDB> | null = null;
 export async function getDb(): Promise<IDBPDatabase<ReadingPartnerDB>> {
   if (dbInstance) return dbInstance;
 
-  dbInstance = await openDB<ReadingPartnerDB>('reading-partner', 4, {
+  dbInstance = await openDB<ReadingPartnerDB>('reading-partner', 5, {
     async upgrade(db, oldVersion, _newVersion, tx) {
       if (oldVersion < 1) {
         db.createObjectStore('series', { keyPath: 'id' });
@@ -102,7 +103,7 @@ export async function getDb(): Promise<IDBPDatabase<ReadingPartnerDB>> {
         }
       }
 
-      if (oldVersion < 4 && oldVersion > 0) {
+      if (oldVersion < 5 && oldVersion > 0) {
         await tx.objectStore('series').clear();
         await tx.objectStore('books').clear();
         await tx.objectStore('chapters').clear();
@@ -540,6 +541,193 @@ export async function updateBookStatus(
 
   await tx.objectStore('searchIndexes').delete(series.id);
   await tx.done;
+  return { ok: true };
+}
+
+export interface BookMetadataUpdateInput {
+  title: string;
+  author: string;
+  isbn: string | null;
+  publicationYear: number | null;
+  coverUrl?: string | null;
+  externalSeriesName?: string | null;
+  externalSeriesOrder?: number | null;
+  seriesName: string | null;
+  seriesOrder: number | null;
+}
+
+export async function updateBookMetadata(
+  bookId: string,
+  input: BookMetadataUpdateInput
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const db = await getDb();
+  const book = await db.get('books', bookId);
+  if (!book) {
+    return { ok: false, error: 'Book not found.' };
+  }
+
+  const allBooks = (await db.getAll('books')).map((item) => normalizeBookRecord(item));
+  const allSeries = await db.getAll('series');
+  const seriesById = new Map(allSeries.map((item) => [item.id, item]));
+  const seriesIdByName = new Map(allSeries.map((item) => [item.name.trim().toLowerCase(), item.id]));
+
+  const nextBook = normalizeBookRecord({ ...book });
+  nextBook.title = input.title.trim() || nextBook.title;
+  nextBook.author = input.author.trim() || nextBook.author;
+  nextBook.isbn = input.isbn?.trim() ? input.isbn.trim() : null;
+  nextBook.publicationYear =
+    typeof input.publicationYear === 'number' && Number.isFinite(input.publicationYear)
+      ? Math.floor(input.publicationYear)
+      : null;
+  if (Object.hasOwn(input, 'coverUrl')) {
+    nextBook.coverUrl = input.coverUrl?.trim() ? input.coverUrl.trim() : null;
+  }
+  if (Object.hasOwn(input, 'externalSeriesName')) {
+    nextBook.externalSeriesName = input.externalSeriesName?.trim() ? input.externalSeriesName.trim() : null;
+  }
+  if (Object.hasOwn(input, 'externalSeriesOrder')) {
+    nextBook.externalSeriesOrder =
+      typeof input.externalSeriesOrder === 'number' && Number.isFinite(input.externalSeriesOrder)
+        ? input.externalSeriesOrder
+        : null;
+  }
+
+  const oldSeriesId = nextBook.seriesId;
+  const desiredSeriesName = input.seriesName?.trim() || null;
+  let targetSeriesId: string | null = null;
+  if (desiredSeriesName) {
+    const existingId = seriesIdByName.get(desiredSeriesName.toLowerCase());
+    if (existingId) {
+      targetSeriesId = existingId;
+    } else {
+      targetSeriesId = createId();
+      const createdSeries: Series = {
+        id: targetSeriesId,
+        name: desiredSeriesName,
+        bookOrder: [],
+        createdAt: new Date().toISOString(),
+      };
+      seriesById.set(targetSeriesId, createdSeries);
+      seriesIdByName.set(desiredSeriesName.toLowerCase(), targetSeriesId);
+    }
+  }
+
+  nextBook.seriesId = targetSeriesId;
+  if (!targetSeriesId) {
+    nextBook.bookNumber = null;
+    if (nextBook.status === 'locked') {
+      nextBook.status = 'reading';
+      if (nextBook.currentChapter === 0) {
+        nextBook.currentChapter = 1;
+      }
+    }
+  }
+
+  const booksBySeries = new Map<string, Book[]>();
+  for (const item of allBooks) {
+    if (item.id === nextBook.id) continue;
+    if (!item.seriesId) continue;
+    const list = booksBySeries.get(item.seriesId) ?? [];
+    list.push({ ...item });
+    booksBySeries.set(item.seriesId, list);
+  }
+
+  if (targetSeriesId) {
+    const seriesBooks = booksBySeries.get(targetSeriesId) ?? [];
+    seriesBooks.sort((a, b) => (a.bookNumber ?? 9999) - (b.bookNumber ?? 9999));
+    const desiredOrder =
+      typeof input.seriesOrder === 'number' && Number.isFinite(input.seriesOrder)
+        ? Math.max(1, Math.floor(input.seriesOrder))
+        : seriesBooks.length + 1;
+    const insertIndex = Math.min(seriesBooks.length, desiredOrder - 1);
+    seriesBooks.splice(insertIndex, 0, nextBook);
+    for (let index = 0; index < seriesBooks.length; index += 1) {
+      seriesBooks[index].bookNumber = index + 1;
+    }
+
+    const progress = recomputeSeriesStatuses(
+      seriesBooks.map((item) => ({
+        id: item.id,
+        bookNumber: item.bookNumber ?? 1,
+        status: item.status,
+        currentChapter: item.currentChapter,
+        totalChapters: item.totalChapters,
+      }))
+    );
+    const progressById = new Map(progress.map((item) => [item.id, item]));
+    for (const item of seriesBooks) {
+      const statusUpdate = progressById.get(item.id);
+      if (statusUpdate) {
+        item.status = statusUpdate.status;
+        item.currentChapter = statusUpdate.currentChapter;
+      }
+    }
+
+    booksBySeries.set(targetSeriesId, seriesBooks);
+  }
+
+  const affectedSeriesIds = new Set<string>();
+  if (oldSeriesId) affectedSeriesIds.add(oldSeriesId);
+  if (targetSeriesId) affectedSeriesIds.add(targetSeriesId);
+
+  const tx = db.transaction(['books', 'series', 'searchIndexes'], 'readwrite');
+
+  if (!targetSeriesId) {
+    await tx.objectStore('books').put(nextBook);
+  } else {
+    const targetBooks = booksBySeries.get(targetSeriesId) ?? [];
+    for (const item of targetBooks) {
+      await tx.objectStore('books').put(item);
+    }
+  }
+
+  if (oldSeriesId && oldSeriesId !== targetSeriesId) {
+    const oldBooks = booksBySeries.get(oldSeriesId) ?? [];
+    oldBooks.sort((a, b) => (a.bookNumber ?? 9999) - (b.bookNumber ?? 9999));
+    for (let index = 0; index < oldBooks.length; index += 1) {
+      oldBooks[index].bookNumber = index + 1;
+    }
+
+    const progress = recomputeSeriesStatuses(
+      oldBooks.map((item) => ({
+        id: item.id,
+        bookNumber: item.bookNumber ?? 1,
+        status: item.status,
+        currentChapter: item.currentChapter,
+        totalChapters: item.totalChapters,
+      }))
+    );
+    const progressById = new Map(progress.map((item) => [item.id, item]));
+    for (const item of oldBooks) {
+      const statusUpdate = progressById.get(item.id);
+      if (statusUpdate) {
+        item.status = statusUpdate.status;
+        item.currentChapter = statusUpdate.currentChapter;
+      }
+      await tx.objectStore('books').put(item);
+    }
+  }
+
+  for (const seriesId of affectedSeriesIds) {
+    const currentSeries = seriesById.get(seriesId);
+    if (!currentSeries) continue;
+    const members = booksBySeries.get(seriesId) ?? [];
+    if (members.length === 0) {
+      await tx.objectStore('series').delete(seriesId);
+      await tx.objectStore('searchIndexes').delete(seriesId);
+      continue;
+    }
+    const orderedMembers = [...members].sort((a, b) => (a.bookNumber ?? 9999) - (b.bookNumber ?? 9999));
+    await tx.objectStore('series').put({
+      ...currentSeries,
+      bookOrder: orderedMembers.map((item) => item.id),
+    });
+    await tx.objectStore('searchIndexes').delete(seriesId);
+  }
+
+  await tx.objectStore('searchIndexes').delete(bookId);
+  await tx.done;
+
   return { ok: true };
 }
 

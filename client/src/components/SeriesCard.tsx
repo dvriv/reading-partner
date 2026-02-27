@@ -10,8 +10,8 @@ interface SeriesCardProps {
   onAddBook: () => void;
   onDeleteSeries: () => void;
   onDeleteBook: (book: Book) => void;
-  onOffloadBook: (book: Book) => void;
   onSetBookStatus: (book: Book, status: Book['status']) => void;
+  onEditBook: (book: Book) => void;
   onSaveOrdering: (nextNumbers: Record<string, number>) => Promise<string | null>;
   collapsed: boolean;
   hasReadingBook: boolean;
@@ -38,8 +38,8 @@ export default function SeriesCard({
   onAddBook,
   onDeleteSeries,
   onDeleteBook,
-  onOffloadBook,
   onSetBookStatus,
+  onEditBook,
   onSaveOrdering,
   collapsed,
   hasReadingBook,
@@ -161,7 +161,22 @@ export default function SeriesCard({
         {books.map((book) => (
           <div key={book.id} className={`group border-b border-[var(--line-subtle)] px-5 py-3 transition last:border-b-0 ${book.status === 'reading' ? 'bg-[var(--paper-surface)] border-l-4 border-l-[#94a3b8] pl-4' : 'bg-[var(--paper-elevated)] hover:bg-[var(--paper-surface)]'}`}>
             <div className="flex items-start justify-between gap-2">
-              <div className="min-w-0">
+              <div className="flex min-w-0 gap-3">
+                <button
+                  type="button"
+                  className="h-16 w-11 shrink-0 overflow-hidden rounded border border-[var(--line-subtle)] bg-[var(--paper-surface)]"
+                  onClick={() => onEditBook(book)}
+                  aria-label={`Edit metadata for ${book.title}`}
+                >
+                  {book.coverUrl ? (
+                    <img src={book.coverUrl} alt={`Cover for ${book.title}`} className="h-full w-full object-cover" loading="lazy" />
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center text-[9px] font-semibold uppercase tracking-wide text-[var(--ink-tertiary)]">
+                      No Cover
+                    </div>
+                  )}
+                </button>
+                <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   {editingOrder ? (
                     <label className="flex items-center gap-1 text-xs text-[var(--ink-tertiary)]">
@@ -182,14 +197,19 @@ export default function SeriesCard({
                       #{book.bookNumber ?? '-'}
                     </span>
                   )}
-                  <p className="truncate text-base font-semibold text-[var(--ink-primary)]">{book.title}</p>
+                  <button
+                    type="button"
+                    className="truncate text-left text-base font-semibold text-[var(--ink-primary)] hover:underline"
+                    onClick={() => onEditBook(book)}
+                  >
+                    {book.title}
+                  </button>
                 </div>
                 <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-[var(--ink-secondary)]">
+                  <span className="truncate max-w-[220px]">{book.author}</span>
+                  <span aria-hidden>•</span>
                   <span>{book.status === 'locked' ? 'Unread' : `Chapter ${book.currentChapter}/${book.totalChapters}`}</span>
                 </div>
-                {!book.hasLocalContent ? (
-                  <p className="mt-1 text-xs text-[var(--warning-ink)]">Local text cleared to save space</p>
-                ) : null}
                 <div className="mt-2 flex flex-wrap gap-1 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                   <button
                     className="rp-btn rp-btn-secondary min-h-9 px-2 text-xs disabled:opacity-60"
@@ -214,23 +234,23 @@ export default function SeriesCard({
                   </button>
                 </div>
               </div>
+              </div>
               <span className={`status-pill ${statusClass(book.status)} ${book.status === 'reading' ? '!bg-[rgba(148,163,184,0.22)] !text-slate-600 !border-[rgba(148,163,184,0.35)]' : ''}`}>{statusLabel(book.status)}</span>
             </div>
             <div className="mt-2 flex justify-end">
               <div className="flex items-center gap-3">
                 <button
+                  className="text-xs font-medium text-[var(--ink-tertiary)] transition hover:text-[var(--accent-binding)]"
+                  onClick={() => onEditBook(book)}
+                >
+                  Edit Metadata
+                </button>
+                <span className="h-1 w-1 rounded-full bg-[var(--line-strong)]" aria-hidden />
+                <button
                   className="text-xs font-medium text-[var(--ink-tertiary)] transition hover:text-[var(--danger-ink)]"
                   onClick={() => onDeleteBook(book)}
                 >
                   Delete Book
-                </button>
-                <span className="h-1 w-1 rounded-full bg-[var(--line-strong)]" aria-hidden />
-                <button
-                  className="text-xs font-medium text-[var(--ink-tertiary)] transition hover:text-[var(--accent-binding)] disabled:opacity-45"
-                  disabled={!book.hasLocalContent}
-                  onClick={() => onOffloadBook(book)}
-                >
-                  Clear Local Data
                 </button>
               </div>
             </div>

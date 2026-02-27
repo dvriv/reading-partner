@@ -6,10 +6,17 @@ interface SettingsModalProps {
   open: boolean;
   accessToken: string;
   onClose: () => void;
+  onLocalDataDeleted: () => Promise<void>;
   onAccountDeleted: () => Promise<void>;
 }
 
-export default function SettingsModal({ open, accessToken, onClose, onAccountDeleted }: SettingsModalProps) {
+export default function SettingsModal({
+  open,
+  accessToken,
+  onClose,
+  onLocalDataDeleted,
+  onAccountDeleted,
+}: SettingsModalProps) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [emailLoading, setEmailLoading] = useState(false);
@@ -87,6 +94,29 @@ export default function SettingsModal({ open, accessToken, onClose, onAccountDel
     }
   }
 
+  async function handleDeleteLocalData() {
+    const confirmed = window.confirm(
+      'Delete all local reading data on this device? This cannot be undone.'
+    );
+    if (!confirmed) return;
+
+    setError(null);
+    setMessage(null);
+    setDeleteLoading(true);
+    try {
+      await clearAllLocalData();
+      if (typeof window !== 'undefined') {
+        window.localStorage.removeItem('reading-partner:collapsed-series');
+      }
+      await onLocalDataDeleted();
+      setMessage('Local data deleted successfully.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete local data.');
+    } finally {
+      setDeleteLoading(false);
+    }
+  }
+
   return (
     <div className="rp-modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="rp-modal w-full max-w-xl p-5 md:p-6" role="dialog" aria-modal="true" aria-label="Settings">
@@ -136,14 +166,24 @@ export default function SettingsModal({ open, accessToken, onClose, onAccountDel
           <div className="rp-surface rounded-xl border border-[rgba(220,38,38,0.22)] p-4">
             <h3 className="text-sm font-semibold text-[var(--danger-ink)]">Delete Account and Data</h3>
             <p className="mt-2 text-xs text-[var(--ink-secondary)]">This permanently deletes your local reading data and your Supabase account.</p>
-            <button
-              type="button"
-              onClick={() => void handleDeleteAccount()}
-              disabled={deleteLoading}
-              className="rp-btn rp-btn-danger mt-3 min-h-10 px-3 text-sm"
-            >
-              {deleteLoading ? 'Deleting...' : 'Delete Account and Data'}
-            </button>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void handleDeleteLocalData()}
+                disabled={deleteLoading}
+                className="rp-btn rp-btn-danger min-h-10 px-3 text-sm"
+              >
+                {deleteLoading ? 'Deleting...' : 'Delete Local Data'}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDeleteAccount()}
+                disabled={deleteLoading}
+                className="rp-btn rp-btn-danger min-h-10 px-3 text-sm"
+              >
+                {deleteLoading ? 'Deleting...' : 'Delete Account and Data'}
+              </button>
+            </div>
           </div>
         </div>
 

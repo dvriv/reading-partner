@@ -1,5 +1,6 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { MiddlewareHandler } from 'hono';
+import { getEnv } from '../env.js';
 
 export type AppBindings = {
   Variables: {
@@ -14,8 +15,9 @@ function getSupabaseClient(): SupabaseClient {
     return supabaseClient;
   }
 
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const env = getEnv();
+  const supabaseUrl = env.supabaseUrl;
+  const supabaseServiceRoleKey = env.supabaseServiceRoleKey;
 
   if (!supabaseUrl || !supabaseServiceRoleKey) {
     throw new Error(

@@ -1,0 +1,15 @@
+export const AI_DEFAULTS = {
+  embeddingProvider: 'voyage',
+  embeddingModel: 'voyage-4',
+  embeddingDimension: 1024,
+  embeddingVersion: 'voyage-4-1024-v1',
+  rerankProvider: 'voyage',
+  rerankModel: 'rerank-2.5-lite',
+  classifierProvider: 'deepseek',
+  classifierModel: 'deepseek-v4-flash',
+  answerProvider: 'deepseek',
+  cheapAnswerModel: 'deepseek-v4-flash',
+  strongAnswerModel: 'deepseek-v4-pro',
+  transcriptionProvider: 'openai',
+  transcriptionModel: 'gpt-4o-mini-transcribe',
+} as const;

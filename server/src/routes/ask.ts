@@ -1,388 +1,334 @@
-import { Hono, type Context } from 'hono';
+import { Hono } from 'hono';
+import { sql } from 'drizzle-orm';
+import type { AskDebug, AskResponse, ContextType } from '@reading-partner/shared';
+import { isAskRequest } from '@reading-partner/shared';
+import { classifyQuestion } from '../ai/classification.js';
+import { generateAnswer } from '../ai/deepseek.js';
+import { selectAnswerModel } from '../ai/model-routing.js';
+import { rerankDocuments } from '../ai/voyage.js';
+import { embedTexts } from '../ai/voyage.js';
+import { getRetrievalConfig } from '../ai/retrieval-config.js';
+import { shouldUseReranker } from '../ai/rerank.js';
+import { filterSpoilerSafe, type ReadingBoundary } from '../ai/spoiler-filter.js';
+import { getDb } from '../db/client.js';
+import { debugLog, getEnv } from '../env.js';
 import { authMiddleware, type AppBindings } from '../middleware/auth.js';
+import {
+  assertCanAskQuestion,
+  getUserPlan,
+  recordEmbeddingUsage,
+  recordQuestionUsage,
+  recordRerankUsage,
+} from '../quota/plans.js';
+import { jsonError } from '../utils/http.js';
 
-type AskChunk = {
-  content: string;
+type Candidate = {
+  id: string;
+  bookId: string;
   bookTitle: string;
-  chapterNumber: number;
+  bookNumber: number | null;
+  chapterNumber: number | null;
   chapterLabel: string;
+  chunkIndex: number;
+  content: string;
+  endOffset: number | null;
+  score: number;
+  rerankScore?: number;
 };
 
-type AskRequest = {
-  seriesName?: string;
-  bookTitle: string;
-  currentChapter: number;
-  currentChapterLabel: string;
-  completedBooks?: string[];
+type PositionRow = {
+  context_id: string;
+  context_name: string;
+  book_title?: string;
+  current_book_number: number | null;
+  current_chapter: number;
+  current_text_offset: number | null;
+  progress_source: 'manual' | 'audio_alignment';
+};
+
+export const askRoute = new Hono<AppBindings>();
+
+async function loadPosition(userId: string, contextType: ContextType, contextId: string): Promise<PositionRow | null> {
+  const db = getDb();
+  if (contextType === 'book') {
+    const rows = await db.execute(sql`
+      select b.id as context_id,
+             b.title as context_name,
+             b.title as book_title,
+             b.book_number as current_book_number,
+             coalesce(rp.current_chapter, b.current_chapter, 1) as current_chapter,
+             rp.current_text_offset,
+             coalesce(rp.progress_source, 'manual') as progress_source
+      from books b
+      left join reading_progress rp on rp.user_id = b.user_id and rp.book_id = b.id
+      where b.user_id = ${userId} and b.id = ${contextId}
+      limit 1
+    `);
+    return (rows[0] as PositionRow | undefined) ?? null;
+  }
+  const rows = await db.execute(sql`
+    select s.id as context_id,
+           s.name as context_name,
+           null::text as book_title,
+           rp.current_book_number,
+           coalesce(rp.current_chapter, 1) as current_chapter,
+           rp.current_text_offset,
+           coalesce(rp.progress_source, 'manual') as progress_source
+    from series s
+    left join reading_progress rp on rp.user_id = s.user_id and rp.series_id = s.id
+    where s.user_id = ${userId} and s.id = ${contextId}
+    limit 1
+  `);
+  return (rows[0] as PositionRow | undefined) ?? null;
+}
+
+function sqlSpoilerClause(boundary: ReadingBoundary): ReturnType<typeof sql> {
+  if (boundary.contextType === 'book') {
+    if (boundary.currentTextOffset == null) {
+      return sql`c.chapter_number <= ${boundary.currentChapter}`;
+    }
+    return sql`(c.chapter_number < ${boundary.currentChapter} or (c.chapter_number = ${boundary.currentChapter} and c.end_offset is not null and c.end_offset <= ${boundary.currentTextOffset}))`;
+  }
+  if (boundary.currentTextOffset == null) {
+    return sql`c.book_number is not null and (c.book_number < ${boundary.currentBookNumber} or (c.book_number = ${boundary.currentBookNumber} and c.chapter_number <= ${boundary.currentChapter}))`;
+  }
+  return sql`c.book_number is not null and (c.book_number < ${boundary.currentBookNumber} or (c.book_number = ${boundary.currentBookNumber} and (c.chapter_number < ${boundary.currentChapter} or (c.chapter_number = ${boundary.currentChapter} and c.end_offset is not null and c.end_offset <= ${boundary.currentTextOffset}))))`;
+}
+
+async function vectorSearch(input: {
+  userId: string;
+  contextType: ContextType;
+  contextId: string;
+  boundary: ReadingBoundary;
+  embedding: number[];
+  limit: number;
+}): Promise<Candidate[]> {
+  const db = getDb();
+  const vectorLiteral = `[${input.embedding.join(',')}]`;
+  const contextClause = input.contextType === 'book' ? sql`c.book_id = ${input.contextId}` : sql`c.series_id = ${input.contextId}`;
+  const rows = await db.execute(sql`
+    select c.id, c.book_id, b.title as book_title, c.book_number, c.chapter_number, c.chapter_label,
+           c.chunk_index, c.content, c.end_offset,
+           (1 - (c.embedding <=> ${vectorLiteral}::vector))::float as score
+    from chunks c
+    join books b on b.id = c.book_id and b.user_id = c.user_id
+    where c.user_id = ${input.userId}
+      and ${contextClause}
+      and c.embedding is not null
+      and ${sqlSpoilerClause(input.boundary)}
+    order by c.embedding <=> ${vectorLiteral}::vector
+    limit ${input.limit}
+  `);
+  return rows as unknown as Candidate[];
+}
+
+async function keywordSearch(input: {
+  userId: string;
+  contextType: ContextType;
+  contextId: string;
+  boundary: ReadingBoundary;
   question: string;
-  chunks: AskChunk[];
-};
-
-type AskResponse = {
-  answer: string;
-  citations: { bookTitle: string; chapterLabel: string; excerpt: string }[];
-  confidence: 'high' | 'medium' | 'low';
-};
-
-type OpenRouterChatResponse = {
-  choices?: Array<{
-    message?: {
-      content?: string;
-    };
-  }>;
-};
-
-class ProviderHttpError extends Error {
-  status: number;
-  body: string;
-  retryAfter: string | null;
-  requestId: string | null;
-
-  constructor(status: number, body: string, retryAfter: string | null, requestId: string | null) {
-    super(`OpenRouter chat error (${status}): ${body || 'No response body'}`);
-    this.name = 'ProviderHttpError';
-    this.status = status;
-    this.body = body;
-    this.retryAfter = retryAfter;
-    this.requestId = requestId;
-  }
+  terms: string[];
+  limit: number;
+}): Promise<Candidate[]> {
+  const db = getDb();
+  const contextClause = input.contextType === 'book' ? sql`c.book_id = ${input.contextId}` : sql`c.series_id = ${input.contextId}`;
+  const query = [input.question, ...input.terms].join(' ');
+  const rows = await db.execute(sql`
+    select c.id, c.book_id, b.title as book_title, c.book_number, c.chapter_number, c.chapter_label,
+           c.chunk_index, c.content, c.end_offset,
+           (ts_rank_cd(c.search_vector, plainto_tsquery('simple', ${query})) +
+            case when c.content ilike ${`%${input.terms[0] ?? input.question.slice(0, 40)}%`} then 0.15 else 0 end)::float as score
+    from chunks c
+    join books b on b.id = c.book_id and b.user_id = c.user_id
+    where c.user_id = ${input.userId}
+      and ${contextClause}
+      and c.search_vector @@ plainto_tsquery('simple', ${query})
+      and ${sqlSpoilerClause(input.boundary)}
+    order by score desc
+    limit ${input.limit}
+  `);
+  return rows as unknown as Candidate[];
 }
 
-const DEFAULT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
-const DEFAULT_OPENROUTER_CHAT_MODEL = 'openai/gpt-oss-120b:free';
-
-function getOpenRouterConfig() {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    throw new Error('Missing required environment variable: OPENROUTER_API_KEY');
+function mergeCandidates(vector: Candidate[], keyword: Candidate[], preferRecent: boolean): Candidate[] {
+  const maxVector = Math.max(0.0001, ...vector.map((item) => item.score));
+  const maxKeyword = Math.max(0.0001, ...keyword.map((item) => item.score));
+  const byId = new Map<string, Candidate>();
+  for (const item of vector) byId.set(item.id, { ...item, score: (item.score / maxVector) * 0.65 });
+  for (const item of keyword) {
+    const current = byId.get(item.id);
+    const keywordScore = (item.score / maxKeyword) * 0.35;
+    byId.set(item.id, { ...(current ?? item), score: (current?.score ?? 0) + keywordScore });
   }
-
-  return {
-    apiKey,
-    baseUrl: process.env.OPENROUTER_BASE_URL || DEFAULT_OPENROUTER_BASE_URL,
-    model: process.env.OPENROUTER_CHAT_MODEL || DEFAULT_OPENROUTER_CHAT_MODEL,
-  };
+  const merged = Array.from(byId.values());
+  for (const item of merged) {
+    if (preferRecent && item.chapterNumber != null) item.score += item.chapterNumber * 0.001;
+  }
+  return merged.sort((a, b) => b.score - a.score);
 }
 
-const MAX_CHUNKS = 20;
-const MAX_TEXT_LENGTH = 10_000;
-const MAX_QUESTION_LENGTH = 2_000;
-
-const askRoute = new Hono<AppBindings>();
-
-function invalidRequest(c: Context, message: string) {
-  return c.json(
-    {
-      error: {
-        code: 'INVALID_REQUEST',
-        message,
-      },
-    },
-    400,
-  );
+function diversify(candidates: Candidate[], finalK: number, diversifyByChapter: boolean): Candidate[] {
+  if (!diversifyByChapter) return candidates.slice(0, finalK);
+  const selected: Candidate[] = [];
+  const perChapter = new Map<string, number>();
+  for (const candidate of candidates) {
+    const key = `${candidate.bookNumber ?? 'book'}:${candidate.chapterNumber}`;
+    const count = perChapter.get(key) ?? 0;
+    if (count >= 2 && selected.length < Math.floor(finalK * 0.8)) continue;
+    selected.push(candidate);
+    perChapter.set(key, count + 1);
+    if (selected.length >= finalK) break;
+  }
+  return selected;
 }
 
-function normalizeAskResponse(raw: string): AskResponse {
-  const fallbackText =
-    "Based on what you've read so far, I don't have enough information to fully answer this.";
-  const trimmed = raw.trim();
-
-  const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  const unfenced = fencedMatch ? fencedMatch[1].trim() : trimmed;
-
-  const jsonObjectMatch = unfenced.match(/\{[\s\S]*\}/);
-  const jsonCandidate = jsonObjectMatch ? jsonObjectMatch[0].trim() : unfenced;
-
-  try {
-    const parsed = JSON.parse(jsonCandidate || '{}') as Partial<AskResponse>;
-    const answer = typeof parsed.answer === 'string' && parsed.answer.trim() ? parsed.answer.trim() : trimmed;
-    const confidence =
-      parsed.confidence === 'high' || parsed.confidence === 'medium' || parsed.confidence === 'low'
-        ? parsed.confidence
-        : 'low';
-
-    const citations = Array.isArray(parsed.citations)
-      ? parsed.citations
-          .map((citation) => {
-            if (!citation || typeof citation !== 'object') return null;
-            const draft = citation as {
-              bookTitle?: unknown;
-              chapterLabel?: unknown;
-              chapterNumber?: unknown;
-              excerpt?: unknown;
-            };
-            if (typeof draft.bookTitle !== 'string' || typeof draft.excerpt !== 'string') {
-              return null;
-            }
-
-            const chapterLabel =
-              typeof draft.chapterLabel === 'string' && draft.chapterLabel.trim().length > 0
-                ? draft.chapterLabel.trim()
-                : Number.isInteger(draft.chapterNumber)
-                  ? `Chapter ${draft.chapterNumber}`
-                  : null;
-
-            if (!chapterLabel) return null;
-
-            return {
-              bookTitle: draft.bookTitle.trim(),
-              chapterLabel,
-              excerpt: draft.excerpt.trim(),
-            };
-          })
-          .filter((citation): citation is { bookTitle: string; chapterLabel: string; excerpt: string } => Boolean(citation))
-      : [];
-
-    return {
-      answer: answer || fallbackText,
-      citations,
-      confidence,
-    };
-  } catch {
-    console.warn('[provider][ask] Non-JSON model output; using text fallback', {
-      preview: trimmed.slice(0, 240),
-    });
-    return {
-      answer: trimmed || fallbackText,
-      citations: [],
-      confidence: 'low',
-    };
-  }
-}
-
-function normalizeAskRequest(input: AskRequest): AskRequest {
-  if (!input || typeof input !== 'object') {
-    throw new TypeError('Body must be a JSON object.');
-  }
-
-  if (typeof input.bookTitle !== 'string' || !input.bookTitle.trim()) {
-    throw new TypeError('"bookTitle" is required and must be a non-empty string.');
-  }
-
-  if (!Number.isInteger(input.currentChapter) || input.currentChapter < 0) {
-    throw new TypeError('"currentChapter" must be an integer >= 0.');
-  }
-
-  if (typeof input.currentChapterLabel !== 'string' || !input.currentChapterLabel.trim()) {
-    throw new TypeError('"currentChapterLabel" is required and must be a non-empty string.');
-  }
-
-  if (typeof input.question !== 'string' || !input.question.trim()) {
-    throw new TypeError('"question" is required and must be a non-empty string.');
-  }
-
-  if (input.question.trim().length > MAX_QUESTION_LENGTH) {
-    throw new TypeError(`"question" exceeds max length of ${MAX_QUESTION_LENGTH} characters.`);
-  }
-
-  if (!Array.isArray(input.chunks) || input.chunks.length === 0) {
-    throw new TypeError('"chunks" must be a non-empty array.');
-  }
-
-  if (input.chunks.length > MAX_CHUNKS) {
-    throw new TypeError(`"chunks" cannot contain more than ${MAX_CHUNKS} items.`);
-  }
-
-  if (input.seriesName !== undefined && (typeof input.seriesName !== 'string' || !input.seriesName.trim())) {
-    throw new TypeError('"seriesName" must be a non-empty string when provided.');
-  }
-
-  if (input.completedBooks !== undefined) {
-    if (!Array.isArray(input.completedBooks)) {
-      throw new TypeError('"completedBooks" must be an array of non-empty strings when provided.');
-    }
-
-    for (let i = 0; i < input.completedBooks.length; i += 1) {
-      const title = input.completedBooks[i];
-      if (typeof title !== 'string' || !title.trim()) {
-        throw new TypeError(`Item at completedBooks[${i}] must be a non-empty string.`);
-      }
-    }
-  }
-
-  for (let i = 0; i < input.chunks.length; i += 1) {
-    const chunk = input.chunks[i];
-
-    if (!chunk || typeof chunk !== 'object') {
-      throw new TypeError(`Item at chunks[${i}] must be an object.`);
-    }
-
-    if (typeof chunk.content !== 'string' || !chunk.content.trim()) {
-      throw new TypeError(`"content" at chunks[${i}] must be a non-empty string.`);
-    }
-
-    if (chunk.content.length > MAX_TEXT_LENGTH) {
-      throw new TypeError(
-        `"content" at chunks[${i}] exceeds max length of ${MAX_TEXT_LENGTH} characters.`,
-      );
-    }
-
-    if (typeof chunk.bookTitle !== 'string' || !chunk.bookTitle.trim()) {
-      throw new TypeError(`"bookTitle" at chunks[${i}] must be a non-empty string.`);
-    }
-
-    if (!Number.isInteger(chunk.chapterNumber) || chunk.chapterNumber < 1) {
-      throw new TypeError(`"chapterNumber" at chunks[${i}] must be an integer >= 1.`);
-    }
-
-    if (typeof chunk.chapterLabel !== 'string' || !chunk.chapterLabel.trim()) {
-      throw new TypeError(`"chapterLabel" at chunks[${i}] must be a non-empty string.`);
-    }
-  }
-
-  return {
-    seriesName: input.seriesName?.trim(),
-    bookTitle: input.bookTitle.trim(),
-    currentChapter: input.currentChapter,
-    currentChapterLabel: input.currentChapterLabel.trim(),
-    completedBooks: input.completedBooks?.map((title) => title.trim()),
-    question: input.question.trim(),
-    chunks: input.chunks.map((chunk) => ({
-      content: chunk.content.trim(),
-      bookTitle: chunk.bookTitle.trim(),
-      chapterNumber: chunk.chapterNumber,
-      chapterLabel: chunk.chapterLabel.trim(),
-    })),
-  };
+function readingPositionText(position: PositionRow, contextType: ContextType): string {
+  const parts = [contextType === 'series' ? `Series: ${position.context_name}` : `Book: ${position.context_name}`];
+  if (position.book_title) parts.push(`Current book: ${position.book_title}`);
+  if (position.current_book_number) parts.push(`Book number: ${position.current_book_number}`);
+  parts.push(`Chapter: ${position.current_chapter}`);
+  if (position.current_text_offset != null) parts.push(`Text offset: ${position.current_text_offset}`);
+  parts.push(`Progress source: ${position.progress_source}`);
+  return parts.join('\n');
 }
 
 askRoute.post('/ask', authMiddleware, async (c) => {
-  let rawBody: AskRequest;
-
+  const userId = c.get('userId');
+  debugLog('AI', 'ask:start', { userId });
   try {
-    rawBody = await c.req.json<AskRequest>();
-  } catch {
-    return c.json(
-      {
-        error: {
-          code: 'INVALID_JSON',
-          message: 'Request body must be valid JSON.',
-        },
+    const body = await c.req.json();
+    if (!isAskRequest(body)) return jsonError(c, 400, 'INVALID_REQUEST', 'Body must include contextType, contextId, and question.');
+
+    debugLog('AI', 'quota check');
+    await assertCanAskQuestion(userId);
+
+    const position = await loadPosition(userId, body.contextType, body.contextId);
+    if (!position) return jsonError(c, 404, 'CONTEXT_NOT_FOUND', 'Book or series not found.');
+
+    const boundary: ReadingBoundary = {
+      contextType: body.contextType,
+      currentBookNumber: position.current_book_number,
+      currentChapter: position.current_chapter,
+      currentTextOffset: position.current_text_offset,
+    };
+
+    const classification = await classifyQuestion({
+      question: body.question,
+      contextType: body.contextType,
+      readingPosition: {
+        seriesName: body.contextType === 'series' ? position.context_name : undefined,
+        bookTitle: body.contextType === 'book' ? position.context_name : position.book_title,
+        currentBookNumber: position.current_book_number ?? undefined,
+        currentChapter: position.current_chapter,
+        currentTextOffset: position.current_text_offset ?? undefined,
+        progressSource: position.progress_source,
       },
-      400,
-    );
-  }
+    });
+    debugLog('AI', 'classifier result', classification);
 
-  let body: AskRequest;
-  try {
-    body = normalizeAskRequest(rawBody);
-  } catch (error) {
-    if (error instanceof TypeError) {
-      return invalidRequest(c, error.message);
-    }
-    throw error;
-  }
+    const config = getRetrievalConfig(classification);
+    debugLog('AI', 'retrieval config', config);
 
-  const { seriesName, bookTitle, currentChapter, currentChapterLabel, completedBooks, question, chunks } = body;
+    const queryEmbedding = await embedTexts([body.question], 'query');
+    await recordEmbeddingUsage(userId, { tokens: queryEmbedding.tokens });
+    debugLog('AI', 'query embedding generated');
 
-  const excerpts = chunks
-    .map(
-      (chunk, index) =>
-        `[Excerpt ${index + 1}, ${chunk.bookTitle}, ${chunk.chapterLabel}]:\n${chunk.content}`,
-    )
-    .join('\n\n---\n\n');
+    const [vectorCandidates, keywordCandidates] = await Promise.all([
+      vectorSearch({ userId, contextType: body.contextType, contextId: body.contextId, boundary, embedding: queryEmbedding.embeddings[0] ?? [], limit: config.vectorK }),
+      keywordSearch({ userId, contextType: body.contextType, contextId: body.contextId, boundary, question: body.question, terms: classification.searchTerms, limit: config.keywordK }),
+    ]);
+    debugLog('AI', 'vector candidates', { count: vectorCandidates.length });
+    debugLog('AI', 'keyword candidates', { count: keywordCandidates.length });
 
-  const progressDescription =
-    seriesName && completedBooks && completedBooks.length > 0
-      ? `The reader is reading the series "${seriesName}". They have completed: ${completedBooks.join(', ')}. They are currently reading "${bookTitle}" and have read up to ${currentChapterLabel}.`
-      : seriesName
-        ? `The reader is reading the series "${seriesName}". They are currently on the first available book "${bookTitle}" and have read up to ${currentChapterLabel}.`
-        : `The reader is reading "${bookTitle}" and has read up to ${currentChapterLabel}.`;
+    const merged = mergeCandidates(vectorCandidates, keywordCandidates, config.preferRecentContext);
+    debugLog('AI', 'merged candidates', { count: merged.length });
 
-  const systemPrompt = `You are a spoiler-free reading companion. ${progressDescription}
+    const filtered = filterSpoilerSafe(merged, boundary);
+    debugLog('AI', 'spoiler filter result', { kept: filtered.safe.length, removed: filtered.removed });
 
-CRITICAL RULES - violating any of these is unacceptable:
-1. ONLY use the provided excerpts to answer. Do NOT use any knowledge from your training data about this book, series, or any other book.
-2. Every factual claim you make MUST be supported by at least one of the provided excerpts.
-3. Cite your sources using [Book Title, Chapter Label] format inline. If all excerpts are from the same book, you may shorten to [Chapter Label].
-4. If the excerpts do not contain enough information to fully answer the question, clearly state: "Based on what you've read so far, I don't have enough information to fully answer this."
-5. NEVER hint at, speculate about, or reference events, character developments, or plot points from chapters or books the reader has not yet reached.
-6. NEVER use phrases like "you'll find out later", "keep reading", or "this becomes important".
-7. Do NOT use any external knowledge about the book, its author, its series, or its fandom.
-8. Keep your answer concise (2-5 sentences for simple questions, up to a short paragraph for recaps).
-9. Return ONLY a valid JSON object. Do not use markdown code fences. Do not add any text before or after the JSON object.
-
-Respond in this JSON format:
-{
-  "answer": "Your answer with [Book Title, Chapter Label] citations inline",
-  "citations": [
-    {"bookTitle": "The Way of Kings", "chapterLabel": "Chapter 5: Bridge Four", "excerpt": "brief relevant quote from the excerpt"}
-  ],
-  "confidence": "high | medium | low"
-}
-
-Set confidence to:
-- "high" if multiple excerpts clearly support the answer
-- "medium" if 1-2 excerpts partially support it
-- "low" if the excerpts barely address the question`;
-
-  try {
-    const openRouter = getOpenRouterConfig();
-    const response = await fetch(`${openRouter.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${openRouter.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: openRouter.model,
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt,
-          },
-          {
-            role: 'user',
-            content: `EXCERPTS:\n\n${excerpts}\n\nQUESTION: ${question}`,
-          },
-        ],
-        temperature: 0.3,
-        response_format: {
-          type: 'json_object',
-        },
-      }),
+    const rerankDecision = shouldUseReranker({
+      classification,
+      config,
+      candidateCount: filtered.safe.length,
+      vectorTopScore: vectorCandidates[0]?.score,
+      keywordTopScore: keywordCandidates[0]?.score,
+      vectorKeywordDisagree: vectorCandidates[0] && keywordCandidates[0] ? vectorCandidates[0].id !== keywordCandidates[0].id : false,
     });
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new ProviderHttpError(
-        response.status,
-        body || response.statusText,
-        response.headers.get('retry-after'),
-        response.headers.get('x-request-id') || response.headers.get('x-client-trace-id'),
-      );
-    }
-
-    const payload = (await response.json()) as OpenRouterChatResponse;
-    const responseText = payload.choices?.[0]?.message?.content ?? '';
-
-    const raw = responseText.trim();
-    const normalized = normalizeAskResponse(raw);
-    return c.json(normalized satisfies AskResponse);
-  } catch (error) {
-    if (error instanceof ProviderHttpError) {
-      console.error('[provider][ask] OpenRouter request failed', {
-        status: error.status,
-        retryAfter: error.retryAfter,
-        requestId: error.requestId,
-        body: error.body.slice(0, 2000),
-      });
+    let candidates = filtered.safe;
+    let rerankUsed = false;
+    if (rerankDecision.use) {
+      const reranked = await rerankDocuments(body.question, candidates.map((item) => item.content), Math.min(config.finalAnswerK, candidates.length));
+      await recordRerankUsage(userId, { tokens: reranked.tokens });
+      candidates = reranked.results.map((result) => ({ ...candidates[result.index], rerankScore: result.score, score: result.score })).filter(Boolean);
+      rerankUsed = true;
+      debugLog('AI', 'rerank result', { count: candidates.length });
     } else {
-      console.error('[provider][ask] Unexpected error', error);
+      debugLog('AI', 'rerank skipped/reason', rerankDecision.reason);
     }
 
-    const message = error instanceof Error ? error.message : 'Unknown chat provider error';
+    const finalChunks = filterSpoilerSafe(diversify(candidates, config.finalAnswerK, config.diversifyByChapter), boundary).safe;
+    debugLog('AI', 'final chunks selected', { count: finalChunks.length });
+    if (finalChunks.length === 0) {
+      await recordQuestionUsage(userId);
+      return c.json({
+        answer: 'There is not enough spoiler-safe context to answer confidently.',
+        citations: [],
+        confidence: 'low',
+        reasonCode: 'NO_SAFE_CONTEXT',
+      } satisfies AskResponse);
+    }
 
-    return c.json(
-      {
-        error: {
-          code: 'CHAT_PROVIDER_ERROR',
-          message,
-        },
-      },
-      502,
-    );
+    const plan = await getUserPlan(userId);
+    const model = selectAnswerModel({ plan, classification, lowConfidenceRetrieval: finalChunks.length < 3 });
+    debugLog('AI', 'answer model selected', { model });
+    const answer = await generateAnswer({
+      model,
+      question: body.question,
+      readingPosition: readingPositionText(position, body.contextType),
+      chunks: finalChunks.map((chunk) => ({ bookTitle: chunk.bookTitle, chapterLabel: chunk.chapterLabel, content: chunk.content })),
+    });
+    debugLog('AI', 'answer generated');
+    await recordQuestionUsage(userId, { inputTokens: answer.inputTokens, outputTokens: answer.outputTokens });
+    await getDb().execute(sql`
+      insert into ai_request_logs (user_id, request_type, model, question_type, rerank_used, vector_candidates, keyword_candidates, final_chunks, success)
+      values (${userId}, 'ask', ${model}, ${classification.questionType}, ${rerankUsed}, ${vectorCandidates.length}, ${keywordCandidates.length}, ${finalChunks.length}, true)
+    `);
+    debugLog('AI', 'usage recorded');
+
+    const debug: AskDebug | undefined = getEnv().aiDebug
+      ? {
+          classification,
+          modelUsed: model,
+          rerankUsed,
+          vectorCandidates: vectorCandidates.length,
+          keywordCandidates: keywordCandidates.length,
+          mergedCandidates: merged.length,
+          finalChunks: finalChunks.length,
+          spoilerFilter: {
+            contextType: body.contextType,
+            currentBookNumber: boundary.currentBookNumber ?? undefined,
+            currentChapter: boundary.currentChapter,
+            currentTextOffset: boundary.currentTextOffset ?? undefined,
+            unsafeChunksRemoved: filtered.removed,
+          },
+          selectedChunks: finalChunks.map((chunk) => ({
+            bookTitle: chunk.bookTitle,
+            chapterLabel: chunk.chapterLabel,
+            chunkIndex: chunk.chunkIndex,
+            score: chunk.score,
+            rerankScore: chunk.rerankScore,
+            preview: chunk.content.slice(0, 220),
+          })),
+        }
+      : undefined;
+
+    debugLog('AI', 'ask:done');
+    return c.json({ ...answer.response, debug } satisfies AskResponse);
+  } catch (error) {
+    debugLog('AI', 'ask:error', error instanceof Error ? error.message : error);
+    await getDb().execute(sql`insert into ai_request_logs (user_id, request_type, success, error_code) values (${userId}, 'ask', false, 'ASK_ERROR')`).catch(() => undefined);
+    return jsonError(c, 502, 'ASK_ERROR', error instanceof Error ? error.message : 'Ask pipeline failed.');
   }
 });
-
-export { askRoute };

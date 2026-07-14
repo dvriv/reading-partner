@@ -1,4 +1,29 @@
-# Implementation Progress (reading-partner2)
+# Implementation Progress
+
+## Current direction
+
+- Active client moved to `apps/expo` using Expo Router for Android, iOS, and web.
+- Server remains Hono and now uses Supabase JWT validation plus Drizzle/Postgres as source of truth.
+- The old Vite `client/` folder is no longer part of the root workspace and is not the active client.
+- AI providers changed to Voyage embeddings/reranking, DeepSeek classification/answers, and OpenAI transcription behind an audio provider abstraction.
+
+## Current verification
+
+- Shared build: `npm --workspace @reading-partner/shared run build` ✅
+- Server build: `npm --workspace server run build` ✅
+- Expo typecheck: `npm --workspace @reading-partner/expo run typecheck` ✅
+- Server tests: `npm --workspace server run test` ✅
+
+## Remaining TODOs
+
+- Harden EPUB parsing across more real-world EPUB layouts.
+- Replace dev audio upload/window placeholder with actual server-side short-window extraction.
+- Add production-grade background processing for large uploads.
+- Add real billing only when product direction requires it.
+
+---
+
+# Previous Implementation Progress (legacy Vite client)
 
 ## Completed server work
 - Hono server scaffolded with CORS, `/api/health`, centralized error/not-found handlers (`server/src/index.ts`).

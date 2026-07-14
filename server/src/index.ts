@@ -3,7 +3,13 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { config } from 'dotenv';
 import { askRoute } from './routes/ask.js';
-import { embedRoute } from './routes/embed.js';
+import { audiobooksRoute } from './routes/audiobooks.js';
+import { booksRoute } from './routes/books.js';
+import { libraryRoute } from './routes/library.js';
+import { progressRoute } from './routes/progress.js';
+import { seriesRoute } from './routes/series.js';
+import { usageRoute } from './routes/usage.js';
+import { getEnv } from './env.js';
 
 config();
 
@@ -12,7 +18,7 @@ const app = new Hono();
 function parseCorsOrigin(): string | string[] {
   const raw = process.env.CORS_ORIGIN;
   if (!raw || !raw.trim()) {
-    return 'http://localhost:5173';
+    return getEnv().corsOrigin;
   }
 
   const origins = raw
@@ -28,15 +34,20 @@ app.use(
   cors({
     origin: parseCorsOrigin(),
     allowHeaders: ['Authorization', 'Content-Type'],
-    allowMethods: ['GET', 'POST', 'OPTIONS'],
+    allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true,
   }),
 );
 
 app.get('/api/health', (c) => c.json({ status: 'ok' }));
 
-app.route('/api', embedRoute);
+app.route('/api', libraryRoute);
+app.route('/api', booksRoute);
+app.route('/api', seriesRoute);
+app.route('/api', progressRoute);
+app.route('/api', audiobooksRoute);
 app.route('/api', askRoute);
+app.route('/api', usageRoute);
 
 app.onError((err, c) => {
   console.error('Unhandled server error:', err);
@@ -63,7 +74,7 @@ app.notFound((c) => {
   );
 });
 
-const port = Number.parseInt(process.env.PORT ?? '3001', 10);
+const port = getEnv().port;
 
 serve(
   {

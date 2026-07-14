@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "SpoilerFree",
+    "slug": "spoilerfree-reading-partner",
+    "scheme": "spoilerfree",
+    "version": "0.2.0",
+    "orientation": "portrait",
+    "platforms": ["android", "ios", "web"],
+    "userInterfaceStyle": "automatic",
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": ["expo-router"],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

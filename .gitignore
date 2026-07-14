@@ -8,6 +8,10 @@ server/node_modules/
 server/dist/
 server/.env
 client/.env
+apps/expo/.env
+apps/expo/.expo/
+apps/expo/dist/
+packages/*/dist/
 *.tsbuildinfo
 example*.html
 example*.png

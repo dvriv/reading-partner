@@ -1,5 +1,5 @@
 {
-  "name": "reading-partner-server",
+  "name": "server",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -8,20 +8,30 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "db:apply": "tsx src/db/apply-migration.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
     "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "vitest run"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.8",
-    "@huggingface/inference": "^4.8.0",
+    "@reading-partner/shared": "file:../packages/shared",
     "@supabase/supabase-js": "^2.49.8",
+    "drizzle-orm": "^0.44.5",
     "dotenv": "^16.4.7",
+    "fast-xml-parser": "^5.2.5",
     "hono": "^4.7.2",
-    "openai": "^4.86.1"
+    "jszip": "^3.10.1",
+    "openai": "^4.86.1",
+    "postgres": "^3.4.7"
   },
   "devDependencies": {
     "@types/node": "^22.13.9",
+    "drizzle-kit": "^0.31.4",
     "tsx": "^4.19.3",
-    "typescript": "^5.8.2"
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }

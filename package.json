@@ -1,0 +1,22 @@
+{
+  "name": "reading-partner",
+  "private": true,
+  "version": "0.2.0",
+  "workspaces": [
+    "apps/*",
+    "server",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:server": "npm --workspace server run dev",
+    "dev:expo": "npm --workspace @reading-partner/expo run start",
+    "android": "npm --workspace @reading-partner/expo run android",
+    "ios": "npm --workspace @reading-partner/expo run ios",
+    "web": "npm --workspace @reading-partner/expo run web",
+    "build": "npm --workspace @reading-partner/shared run build && npm --workspace server run build",
+    "test": "npm --workspace server run test"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}
